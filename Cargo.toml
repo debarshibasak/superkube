@@ -1,0 +1,59 @@
+[package]
+name = "kais"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal Kubernetes-like platform in Rust"
+authors = ["System32 AI"]
+license = "MIT"
+
+[[bin]]
+name = "kais"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Web framework
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+
+# Serialization (K8s API compatible)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Core types
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Container runtime
+containerd-client = "0.5"
+tonic = "0.11"
+prost = "0.12"
+
+# Logging & errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+
+# HTTP client (for node agent -> server)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# WebSocket
+tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+tokio-test = "0.4"

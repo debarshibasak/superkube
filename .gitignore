@@ -1,0 +1,45 @@
+# Rust build artifacts
+/target/
+debug/
+release/
+
+# Cargo lock file (optional - keep for binaries, ignore for libraries)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+*.profraw
+coverage/
+tarpaulin-report.html
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+
+# Backup files
+*.bak
+*.backup
