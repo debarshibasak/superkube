@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::db::{
     DaemonSetRepository, DeploymentRepository, EndpointsRepository, EventRepository,
-    NodeRepository, PodRepository, ServiceRepository, StatefulSetRepository,
+    LeaseManager, NodeRepository, PodRepository, ServiceRepository, StatefulSetRepository,
 };
 use crate::models::{
     DaemonSet, Deployment, Endpoints, EndpointAddress, EndpointPort, EndpointSubset,
@@ -17,14 +17,23 @@ use crate::models::{
 /// Controller manager runs reconciliation loops for deployments and services
 pub struct ControllerManager {
     pool: AnyPool,
+    leases: LeaseManager,
 }
 
+/// How long a per-controller lease is valid. Comfortably longer than the
+/// 5s reconcile tick so a single missed scheduling slot doesn't drop the
+/// lease, but short enough that a crashed master is recovered within ~30s.
+const LEASE_TTL: Duration = Duration::from_secs(30);
+
 impl ControllerManager {
-    pub fn new(pool: AnyPool) -> Self {
-        Self { pool }
+    pub fn new(pool: AnyPool, leases: LeaseManager) -> Self {
+        Self { pool, leases }
     }
 
-    /// Run all controllers
+    /// Run all controllers. In Postgres mode each reconcile pass first
+    /// acquires a named lease — if another master holds it, this pass is
+    /// skipped and we try again next tick. In SQLite mode `try_acquire`
+    /// short-circuits to true and the loop runs as before.
     pub async fn run(&self) {
         tracing::info!("Controller manager started");
         let mut interval = interval(Duration::from_secs(5));
@@ -32,24 +41,34 @@ impl ControllerManager {
         loop {
             interval.tick().await;
 
-            if let Err(e) = self.reconcile_deployments().await {
-                tracing::error!("Deployment controller error: {}", e);
+            if self.leases.try_acquire("controller/deployment", LEASE_TTL).await {
+                if let Err(e) = self.reconcile_deployments().await {
+                    tracing::error!("Deployment controller error: {}", e);
+                }
             }
 
-            if let Err(e) = self.reconcile_statefulsets().await {
-                tracing::error!("StatefulSet controller error: {}", e);
+            if self.leases.try_acquire("controller/statefulset", LEASE_TTL).await {
+                if let Err(e) = self.reconcile_statefulsets().await {
+                    tracing::error!("StatefulSet controller error: {}", e);
+                }
             }
 
-            if let Err(e) = self.reconcile_daemonsets().await {
-                tracing::error!("DaemonSet controller error: {}", e);
+            if self.leases.try_acquire("controller/daemonset", LEASE_TTL).await {
+                if let Err(e) = self.reconcile_daemonsets().await {
+                    tracing::error!("DaemonSet controller error: {}", e);
+                }
             }
 
-            if let Err(e) = self.reconcile_pods().await {
-                tracing::error!("Pod controller error: {}", e);
+            if self.leases.try_acquire("controller/pod", LEASE_TTL).await {
+                if let Err(e) = self.reconcile_pods().await {
+                    tracing::error!("Pod controller error: {}", e);
+                }
             }
 
-            if let Err(e) = self.reconcile_services().await {
-                tracing::error!("Service controller error: {}", e);
+            if self.leases.try_acquire("controller/service", LEASE_TTL).await {
+                if let Err(e) = self.reconcile_services().await {
+                    tracing::error!("Service controller error: {}", e);
+                }
             }
         }
     }

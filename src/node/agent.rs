@@ -299,6 +299,9 @@ impl NodeAgent {
         let mut all_running = true;
         let mut any_failed = false;
         let mut earliest_start: Option<chrono::DateTime<Utc>> = None;
+        // Real container IP, captured from whichever container reports it.
+        // All containers in a pod share a netns so they all carry the same IP.
+        let mut runtime_ip: Option<String> = None;
 
         // Observe + act per container.
         for container in &pod.spec.containers {
@@ -389,6 +392,11 @@ impl NodeAgent {
                             // out of the matched arm.
                             // Use a sentinel: build the ContainerStatus inline
                             // here rather than fall through.
+                            if runtime_ip.is_none() {
+                                if let Some(real) = info.ip.as_ref() {
+                                    runtime_ip = Some(real.clone());
+                                }
+                            }
                             if info.running {
                                 if let Some(t) = info.started_at {
                                     earliest_start =
@@ -456,6 +464,12 @@ impl NodeAgent {
             }
             drop(state);
 
+            if runtime_ip.is_none() {
+                if let Some(real) = info.ip.as_ref() {
+                    runtime_ip = Some(real.clone());
+                }
+            }
+
             if !info.running {
                 all_running = false;
                 if info.exit_code.unwrap_or(0) != 0 {
@@ -488,9 +502,20 @@ impl NodeAgent {
             PodPhase::Pending
         };
 
-        let pod_ip = {
-            let s = self.state.read().await;
-            format!("{}.{}", s.pod_cidr_prefix, (pod_uid.as_u128() % 254 + 1) as u8)
+        // Prefer the runtime-reported IP (Docker's bridge IP, embedded
+        // runtime's IPAM-assigned IP). Falls back to a deterministic
+        // pod-CIDR-derived address only if no container has come up far
+        // enough to expose a real one yet.
+        let pod_ip = match runtime_ip {
+            Some(ip) => ip,
+            None => {
+                let s = self.state.read().await;
+                format!(
+                    "{}.{}",
+                    s.pod_cidr_prefix,
+                    (pod_uid.as_u128() % 254 + 1) as u8
+                )
+            }
         };
 
         self.publish_pod_status(

@@ -43,6 +43,10 @@ pub struct BundleInputs<'a> {
     pub container: &'a Container,
     /// The image config we pulled for this container.
     pub image: &'a ImageConfig,
+    /// Optional pre-created network namespace path. When present, libcontainer
+    /// joins this existing netns (set up by our mini-CNI) instead of creating
+    /// a fresh one. Convention: `/var/run/netns/<pod_name>`.
+    pub netns_path: Option<&'a str>,
 }
 
 /// Generate an OCI runtime spec and write it to `<bundle_dir>/config.json`.
@@ -79,7 +83,7 @@ pub fn build_spec(inputs: &BundleInputs<'_>) -> Result<Spec> {
         .context("building OCI root")?;
 
     let linux = LinuxBuilder::default()
-        .namespaces(default_namespaces()?)
+        .namespaces(default_namespaces(inputs.netns_path)?)
         .build()
         .context("building OCI linux section")?;
 
@@ -167,23 +171,37 @@ fn parse_user(s: Option<&str>) -> (u32, u32) {
     (uid, gid)
 }
 
-fn default_namespaces() -> Result<Vec<oci_spec::runtime::LinuxNamespace>> {
-    let kinds = [
+fn default_namespaces(
+    netns_path: Option<&str>,
+) -> Result<Vec<oci_spec::runtime::LinuxNamespace>> {
+    let mut out = Vec::new();
+    for kind in [
         LinuxNamespaceType::Pid,
-        LinuxNamespaceType::Network,
         LinuxNamespaceType::Ipc,
         LinuxNamespaceType::Uts,
         LinuxNamespaceType::Mount,
-    ];
-    kinds
-        .into_iter()
-        .map(|t| {
+    ] {
+        out.push(
             LinuxNamespaceBuilder::default()
-                .typ(t)
+                .typ(kind)
                 .build()
-                .context("building namespace")
-        })
-        .collect()
+                .context("building namespace")?,
+        );
+    }
+    // Network namespace: join the pre-built one if the caller passed a path,
+    // otherwise let libcontainer create a fresh (and isolated, no-network) one.
+    let net_ns = match netns_path {
+        Some(p) => LinuxNamespaceBuilder::default()
+            .typ(LinuxNamespaceType::Network)
+            .path(std::path::PathBuf::from(p))
+            .build(),
+        None => LinuxNamespaceBuilder::default()
+            .typ(LinuxNamespaceType::Network)
+            .build(),
+    }
+    .context("building network namespace")?;
+    out.push(net_ns);
+    Ok(out)
 }
 
 /// The standard set of mounts every OCI container expects.
@@ -341,6 +359,7 @@ mod tests {
             rootfs_path: "rootfs",
             container: &c,
             image: &img(),
+            netns_path: None,
         };
         let spec = build_spec(&inputs).unwrap();
         assert_eq!(spec.hostname().as_deref(), Some("demo"));

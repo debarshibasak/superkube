@@ -36,12 +36,17 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use crate::models::Container as PodContainer;
+use crate::node::network;
 use crate::node::oci;
 
 use super::{ContainerInfo, ExecSession, LogOptions, LogStream, PortMapping, Runtime};
 
 const STATE_ROOT: &str = "/var/lib/superkube";
 const ID_PREFIX: &str = "embedded://";
+/// /24 the embedded runtime allocates pod IPs from. The CIDR config flag's
+/// first three octets feed in here through `superkube node`'s plumbing in a
+/// follow-up; for now we hard-code the historical default.
+const POD_CIDR_PREFIX: &str = "10.244.0";
 
 pub struct EmbeddedRuntime {
     /// Where libcontainer stashes its per-container state directories.
@@ -51,12 +56,15 @@ pub struct EmbeddedRuntime {
     /// Where we write bundle/<name>/{rootfs, config.json} for each container.
     bundle_root: PathBuf,
     containers: Arc<Mutex<HashMap<String, ContainerEntry>>>,
+    ipam: Arc<network::Ipam>,
 }
 
 struct ContainerEntry {
     name: String,
     started_at: DateTime<Utc>,
     image: String,
+    /// Per-pod network handle, kept for teardown.
+    pod_net: Option<network::PodNetwork>,
 }
 
 impl EmbeddedRuntime {
@@ -70,8 +78,6 @@ impl EmbeddedRuntime {
             })?;
         }
 
-        // Sanity-check libcontainer's runtime expectations early so the agent
-        // doesn't spawn a broken runtime mid-pod-creation.
         if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
             tracing::warn!(
                 "embedded runtime: cgroups v2 not detected (/sys/fs/cgroup/cgroup.controllers \
@@ -79,17 +85,38 @@ impl EmbeddedRuntime {
             );
         }
 
+        let ipam = Arc::new(network::Ipam::new(POD_CIDR_PREFIX));
+
+        // Set up the host bridge + MASQUERADE once. Failing here doesn't kill
+        // the runtime — pods will run with no networking, but we'll log loudly.
+        let gateway = ipam.gateway();
+        if let Err(e) = init_host_network(gateway).await {
+            tracing::warn!("embedded: host network setup failed ({e}); pods will lack connectivity");
+        }
+
         Ok(Self {
             state_path,
             image_root,
             bundle_root,
             containers: Arc::new(Mutex::new(HashMap::new())),
+            ipam,
         })
     }
 
     fn strip(id: &str) -> &str {
         id.strip_prefix(ID_PREFIX).unwrap_or(id)
     }
+}
+
+async fn init_host_network(gateway: std::net::Ipv4Addr) -> anyhow::Result<()> {
+    let (conn, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(conn);
+    network::ensure_bridge(&handle, gateway).await?;
+    // /24 derived from the gateway: x.y.z.0/24
+    let octets = gateway.octets();
+    let cidr = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+    network::iptables::ensure_masquerade(&cidr)?;
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -106,12 +133,29 @@ impl Runtime for EmbeddedRuntime {
         // 1. Pull image (cached if already on disk).
         let pulled = oci::image::pull(&container.image, &self.image_root).await?;
 
-        // 2. Build bundle: <bundle_root>/<name>/{rootfs -> pulled.rootfs, config.json}
+        // 2. Set up the pod network: allocate IP, create netns, veth into bridge.
+        // If anything fails we still try to run the container but with no
+        // connectivity — the IP assignment is rolled back in IPAM either way.
+        let pod_ip = self.ipam.allocate(name)?;
+        let gateway = self.ipam.gateway();
+        let pod_net = match network::setup_pod_network(name, pod_ip, gateway).await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::warn!(
+                    "embedded: network setup for {} failed ({e}); container will run without networking",
+                    name
+                );
+                self.ipam.release(name);
+                None
+            }
+        };
+        let netns_path: Option<String> =
+            pod_net.as_ref().map(|n| n.netns_path.display().to_string());
+
+        // 3. Build bundle: <bundle_root>/<name>/{rootfs -> pulled.rootfs, config.json}
         let bundle_dir = self.bundle_root.join(name);
         std::fs::create_dir_all(&bundle_dir)?;
         let rootfs_link = bundle_dir.join("rootfs");
-        // Symlink rootfs in. Keeps bundles cheap; when the same image backs
-        // multiple containers we don't duplicate the layers.
         if rootfs_link.exists() || rootfs_link.is_symlink() {
             std::fs::remove_file(&rootfs_link).ok();
         }
@@ -123,6 +167,7 @@ impl Runtime for EmbeddedRuntime {
                 rootfs_path: "rootfs",
                 container,
                 image: &pulled.config,
+                netns_path: netns_path.as_deref(),
             },
         )?;
 
@@ -161,6 +206,7 @@ impl Runtime for EmbeddedRuntime {
                 name: name.to_string(),
                 started_at: Utc::now(),
                 image: container.image.clone(),
+                pod_net,
             },
         );
 
@@ -189,13 +235,19 @@ impl Runtime for EmbeddedRuntime {
             Err(_) => false,
         };
 
+        let ip = entry
+            .pod_net
+            .as_ref()
+            .map(|n| n.pod_ip.to_string());
+
         Ok(Some(ContainerInfo {
             id: id.clone(),
             running,
             restart_count: 0,
             started_at: Some(entry.started_at),
             exit_code: None,
-            // No port publishing yet — networking is a TODO.
+            ip,
+            // No port publishing in the embedded path yet.
             port_mappings: Vec::<PortMapping>::new(),
         }))
     }

@@ -120,6 +120,59 @@ impl Default for ConfigMap {
     }
 }
 
+// --- Role / RoleBinding (namespaced) -----------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Role {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub rules: Vec<PolicyRule>,
+}
+
+impl Default for Role {
+    fn default() -> Self {
+        Self {
+            type_meta: TypeMeta {
+                api_version: Some("rbac.authorization.k8s.io/v1".into()),
+                kind: Some("Role".into()),
+            },
+            metadata: ObjectMeta::default(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleBinding {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub subjects: Vec<RbacSubject>,
+    #[serde(default)]
+    pub role_ref: RoleRef,
+}
+
+impl Default for RoleBinding {
+    fn default() -> Self {
+        Self {
+            type_meta: TypeMeta {
+                api_version: Some("rbac.authorization.k8s.io/v1".into()),
+                kind: Some("RoleBinding".into()),
+            },
+            metadata: ObjectMeta::default(),
+            subjects: Vec::new(),
+            role_ref: RoleRef::default(),
+        }
+    }
+}
+
 // --- ClusterRole / ClusterRoleBinding ----------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

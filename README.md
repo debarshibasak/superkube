@@ -1,6 +1,8 @@
 # Superkube
 
-A minimal, single-binary Kubernetes-compatible control plane in Rust.
+A minimal, single-binary Kubernetes-compatible control plane in Rust. Building it just because I want to build it.
+
+PS: I am working towards making this platform production grade.
 
 `superkube server` boots the API server **and** registers the host as a node — one process, one binary, real containers running through Docker (macOS) or libcontainer (Linux), accessible from real `kubectl`.
 
@@ -55,6 +57,60 @@ Most of `kubectl get/apply/delete/describe/logs/exec/port-forward/cluster-info` 
 │    any   → mock (in-memory, for tests)                                  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Multi-master with PostgreSQL
+
+Point N copies of `superkube server` at the same Postgres URL and they all become active masters. Every API server is fully usable; coordination of the *write paths* (controllers + scheduler) happens through short-lived leases in a `leases` table, so any single object is reconciled by exactly one master at a time. Adding a master is just another process with the same `--db-url`.
+
+```
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │           kubectl / clients              workers (superkube node)   │
+   └──────────────┬─────────────────────────────────────┬────────────────┘
+                  │                                     │  HTTP/WebSocket
+                  ▼                                     ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                       Load balancer  (:6443)                        │
+   │                       round-robin / least-conn                      │
+   └────────────┬──────────────────┬───────────────────┬─────────────────┘
+                ▼                  ▼                   ▼
+   ┌────────────────────┐ ┌────────────────────┐ ┌────────────────────┐
+   │   superkube #1     │ │   superkube #2     │ │   superkube #3     │
+   │   (active master)  │ │   (active master)  │ │   (active master)  │
+   │                    │ │                    │ │                    │
+   │  API server  ✓     │ │  API server  ✓     │ │  API server  ✓     │
+   │  Controllers (lease)│ │  Controllers (lease)│ │  Controllers (lease)│
+   │  Scheduler   (lease)│ │  Scheduler   (lease)│ │  Scheduler   (lease)│
+   │  embedded agent    │ │  embedded agent    │ │  embedded agent    │
+   └──────────┬─────────┘ └──────────┬─────────┘ └──────────┬─────────┘
+              │                      │                      │
+              │            --db-url=postgres://…            │
+              └──────────────────────┼──────────────────────┘
+                                     ▼
+              ┌──────────────────────────────────────────────┐
+              │                 PostgreSQL                   │
+              │      primary  ──streaming repl──►  replica   │
+              │                                              │
+              │  Tables:  pods / deployments / services /…   │
+              │           + leases  (controller/deployment,  │
+              │             controller/scheduler, …)         │
+              │                                              │
+              │  Single source of truth. Each named lease    │
+              │  has one current `holder` — that holder is   │
+              │  the only master running that controller     │
+              │  for the next ~30s.                          │
+              └──────────────────────────────────────────────┘
+```
+
+How dispatch works:
+
+- **API serves are symmetric.** Any master answers reads and writes; the LB just round-robins.
+- **Per-controller leases (Postgres only).** Each tick, every master tries to grab the lease for `controller/deployment`, `controller/statefulset`, `controller/daemonset`, `controller/pod`, `controller/service`, and `scheduler`. Whoever wins runs that loop; the others skip until the lease frees up. Different leases land on different masters, so the work spreads.
+- **Acquisition is one UPSERT.** `INSERT … ON CONFLICT (name) DO UPDATE … WHERE leases.holder = me OR leases.expires_at < now()` — a row is taken over only if it's stale. No advisory locks, no long-held connections.
+- **Failure recovery is the TTL.** If the lease holder crashes, the lease expires after 30s and another master picks it up on its next tick.
+- **SQLite mode skips this entirely.** SQLite is single-process by design, so the lease layer short-circuits to "always own it" — the `leases` table is created but never written.
+- **Work execution still flows through `pod.spec.nodeName`.** The scheduler (whichever master holds its lease) writes `nodeName`; the embedded agent on that host's master picks the pod up and runs it. Masters are also nodes, so this is the same path as a single-master cluster.
+- **HA is the database's job.** Use a managed Postgres or a primary/replica with automatic failover (Patroni, RDS Multi-AZ, Cloud SQL HA). Superkube just needs one connection string.
+- **Workers don't pin to a master.** The node agent talks HTTP/WebSocket to the LB; any master answers pod sync, log relay, and exec.
 
 ## Quick start
 
@@ -175,6 +231,17 @@ Server boots the API + an embedded node agent that registers the host as the con
 | `mock` | any | nothing | In-memory stub for tests / dev without a runtime. |
 
 The embedded path is the answer to "single static binary, no host daemon" on Linux: `superkube node --runtime=embedded` pulls images itself and hands the OCI bundle to libcontainer for namespaces / cgroups v2 / pivot_root.
+
+## Ports
+
+| Port | Who | What |
+|------|-----|------|
+| **6443** | superkube server | Kubernetes API (kubectl talks here) |
+| **10250** | superkube node agent | Logs / exec / port-forward HTTP+WS endpoint |
+| **30000–32767** | superkube node proxy | NodePort listeners — one TCP socket per `type: NodePort` Service, opened on `0.0.0.0:<nodePort>` |
+| pod's `containerPort` (e.g. **80**) | the container itself | Inside the pod's netns, on the pod IP (`10.244.0.X` by default) |
+
+The CNI / bridge layer doesn't open any port — it's just netlink syscalls into the kernel to wire up `superkube0`, veth pairs, IPs, and routes. Nothing listens for connections there.
 
 ## Resources
 

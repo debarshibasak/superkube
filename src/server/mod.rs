@@ -14,6 +14,8 @@ use sqlx::AnyPool;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
+use crate::db::{Backend, LeaseManager};
+
 pub use controller::ControllerManager;
 pub use scheduler::Scheduler;
 
@@ -48,6 +50,18 @@ pub async fn run(
 
     tracing::info!("pod CIDR: {}, service CIDR: {}", pod_cidr, service_cidr);
 
+    // Per-controller leases coordinate work when multiple `superkube server`
+    // processes share a Postgres. SQLite mode short-circuits to "always own
+    // the lease" because only one process is touching the DB.
+    let backend = Backend::from_url(db_url);
+    let leases = LeaseManager::new(pool.clone(), backend);
+    if backend == Backend::Postgres {
+        tracing::info!(
+            "multi-master mode: holder={} (per-controller leases active)",
+            leases.holder()
+        );
+    }
+
     // Create app state
     let state = Arc::new(AppState {
         pool: pool.clone(),
@@ -62,8 +76,8 @@ pub async fn run(
         .with_state(state.clone());
 
     // Start background controllers
-    let controller = ControllerManager::new(pool.clone());
-    let scheduler = Scheduler::new(pool.clone());
+    let controller = ControllerManager::new(pool.clone(), leases.clone());
+    let scheduler = Scheduler::new(pool.clone(), leases.clone());
 
     tokio::spawn(async move {
         controller.run().await;

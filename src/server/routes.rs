@@ -170,6 +170,34 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .delete(api::delete_config_map),
         )
         .route("/api/v1/configmaps", get(api::list_all_config_maps))
+        // Roles (namespaced)
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/:namespace/roles",
+            get(api::list_roles).post(api::create_role),
+        )
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/:namespace/roles/:name",
+            get(api::get_role).put(api::update_role).delete(api::delete_role),
+        )
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/roles",
+            get(api::list_all_roles),
+        )
+        // RoleBindings (namespaced)
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/:namespace/rolebindings",
+            get(api::list_role_bindings).post(api::create_role_binding),
+        )
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/:namespace/rolebindings/:name",
+            get(api::get_role_binding)
+                .put(api::update_role_binding)
+                .delete(api::delete_role_binding),
+        )
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/rolebindings",
+            get(api::list_all_role_bindings),
+        )
         // ClusterRoles
         .route(
             "/apis/rbac.authorization.k8s.io/v1/clusterroles",

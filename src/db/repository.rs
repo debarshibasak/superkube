@@ -2067,3 +2067,141 @@ impl ClusterRoleBindingRepository {
     }
 }
 
+
+// ============================================================================
+// Role (namespaced)
+// ============================================================================
+
+pub struct RoleRepository;
+
+impl RoleRepository {
+    pub async fn create(pool: &AnyPool, r: &Role) -> Result<Role> {
+        let meta = &r.metadata;
+        let uid = meta.uid.unwrap_or_else(Uuid::new_v4);
+        let name = meta.name().to_string();
+        let namespace = meta.namespace().to_string();
+        let labels = json_str(&meta.labels)?;
+        let annotations = json_str(&meta.annotations)?;
+        let spec = json_str(r)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO roles (uid, name, namespace, labels, annotations, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name, namespace) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string()).bind(&name).bind(&namespace)
+        .bind(&labels).bind(&annotations).bind(&spec)
+        .bind(&now).bind(&now).execute(pool).await?;
+        Self::get(pool, &namespace, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, namespace: &str, name: &str) -> Result<Role> {
+        let row = sqlx::query("SELECT uid, name, namespace, spec, created_at FROM roles WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("roles.rbac.authorization.k8s.io \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool, namespace: Option<&str>) -> Result<Vec<Role>> {
+        let rows = if let Some(ns) = namespace {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM roles WHERE namespace = ? ORDER BY created_at DESC").bind(ns).fetch_all(pool).await?
+        } else {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM roles ORDER BY created_at DESC").fetch_all(pool).await?
+        };
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, namespace: &str, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM roles WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("roles \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> Role {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let ns: String = row.get("namespace");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut r: Role = json_from(&spec);
+        r.metadata.name = Some(name);
+        r.metadata.namespace = Some(ns);
+        r.metadata.uid = Some(parse_uid(&uid));
+        r.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        r
+    }
+}
+
+// ============================================================================
+// RoleBinding (namespaced)
+// ============================================================================
+
+pub struct RoleBindingRepository;
+
+impl RoleBindingRepository {
+    pub async fn create(pool: &AnyPool, b: &RoleBinding) -> Result<RoleBinding> {
+        let meta = &b.metadata;
+        let uid = meta.uid.unwrap_or_else(Uuid::new_v4);
+        let name = meta.name().to_string();
+        let namespace = meta.namespace().to_string();
+        let labels = json_str(&meta.labels)?;
+        let annotations = json_str(&meta.annotations)?;
+        let spec = json_str(b)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO rolebindings (uid, name, namespace, labels, annotations, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name, namespace) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string()).bind(&name).bind(&namespace)
+        .bind(&labels).bind(&annotations).bind(&spec)
+        .bind(&now).bind(&now).execute(pool).await?;
+        Self::get(pool, &namespace, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, namespace: &str, name: &str) -> Result<RoleBinding> {
+        let row = sqlx::query("SELECT uid, name, namespace, spec, created_at FROM rolebindings WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("rolebindings.rbac.authorization.k8s.io \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool, namespace: Option<&str>) -> Result<Vec<RoleBinding>> {
+        let rows = if let Some(ns) = namespace {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM rolebindings WHERE namespace = ? ORDER BY created_at DESC").bind(ns).fetch_all(pool).await?
+        } else {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM rolebindings ORDER BY created_at DESC").fetch_all(pool).await?
+        };
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, namespace: &str, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM rolebindings WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("rolebindings \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> RoleBinding {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let ns: String = row.get("namespace");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut b: RoleBinding = json_from(&spec);
+        b.metadata.name = Some(name);
+        b.metadata.namespace = Some(ns);
+        b.metadata.uid = Some(parse_uid(&uid));
+        b.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        b
+    }
+}

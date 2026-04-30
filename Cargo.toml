@@ -74,6 +74,10 @@ serde_urlencoded = "0.7"
 # Linux-only: it pulls in nix, libseccomp, etc. that don't build on macOS.
 [target.'cfg(target_os = "linux")'.dependencies]
 libcontainer = { version = "0.5", default-features = false, features = ["v2"] }
+# Built-in mini-CNI: bridge + veth + IP setup via netlink, no host plugins.
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
+nix = { version = "0.29", features = ["sched", "fs", "mount", "process"] }
 
 # bollard talks to the host Docker daemon over /var/run/docker.sock.
 # macOS-only: there, Docker Desktop runs the Linux VM that hosts containers.

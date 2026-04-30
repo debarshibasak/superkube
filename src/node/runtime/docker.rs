@@ -230,12 +230,30 @@ impl Runtime for DockerRuntime {
                     .map(|ports| parse_docker_ports(ports))
                     .unwrap_or_default();
 
+                // Real container IP from Docker's bridge. Prefer the explicit
+                // `networks` map (modern), fall back to legacy `ip_address`.
+                let ip = inspect
+                    .network_settings
+                    .as_ref()
+                    .and_then(|ns| {
+                        ns.networks
+                            .as_ref()
+                            .and_then(|m| {
+                                m.values()
+                                    .filter_map(|n| n.ip_address.as_ref())
+                                    .find(|s| !s.is_empty())
+                                    .cloned()
+                            })
+                            .or_else(|| ns.ip_address.clone().filter(|s| !s.is_empty()))
+                    });
+
                 Ok(Some(ContainerInfo {
                     id: format!("{ID_PREFIX}{}", id),
                     running,
                     restart_count,
                     started_at,
                     exit_code,
+                    ip,
                     port_mappings,
                 }))
             }

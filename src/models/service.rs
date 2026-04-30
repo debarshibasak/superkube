@@ -47,12 +47,12 @@ pub struct ServiceSpec {
     #[serde(rename = "type", default)]
     pub service_type: ServiceType,
 
-    /// ClusterIP - virtual IP address
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// ClusterIP — virtual IP address. k8s spells this `clusterIP`.
+    #[serde(default, rename = "clusterIP", skip_serializing_if = "Option::is_none")]
     pub cluster_ip: Option<String>,
 
-    /// External IPs for the service
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// External IPs for the service. k8s spells this `externalIPs`.
+    #[serde(default, rename = "externalIPs", skip_serializing_if = "Option::is_none")]
     pub external_i_ps: Option<Vec<String>>,
 
     /// Session affinity (None, ClientIP)

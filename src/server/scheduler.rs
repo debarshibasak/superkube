@@ -1,7 +1,7 @@
 use sqlx::AnyPool;
 use tokio::time::{interval, Duration};
 
-use crate::db::{NodeRepository, PodRepository};
+use crate::db::{LeaseManager, NodeRepository, PodRepository};
 use crate::models::*;
 
 use super::controller;
@@ -9,19 +9,30 @@ use super::controller;
 /// Scheduler assigns pending pods to nodes
 pub struct Scheduler {
     pool: AnyPool,
+    leases: LeaseManager,
 }
 
+/// Scheduler lease TTL. Multi-master setups must guarantee only one
+/// scheduler is binding pods at a time — two schedulers picking different
+/// nodes for the same pod would race on `pods.node_name`.
+const SCHEDULER_LEASE_TTL: Duration = Duration::from_secs(30);
+
 impl Scheduler {
-    pub fn new(pool: AnyPool) -> Self {
-        Self { pool }
+    pub fn new(pool: AnyPool, leases: LeaseManager) -> Self {
+        Self { pool, leases }
     }
 
-    /// Run the scheduler loop
+    /// Run the scheduler loop. In Postgres mode the lease ensures only one
+    /// master at a time picks nodes for pending pods.
     pub async fn run(&self) {
         let mut interval = interval(Duration::from_secs(2));
 
         loop {
             interval.tick().await;
+
+            if !self.leases.try_acquire("scheduler", SCHEDULER_LEASE_TTL).await {
+                continue;
+            }
 
             if let Err(e) = self.schedule_pending_pods().await {
                 tracing::error!("Scheduler error: {}", e);

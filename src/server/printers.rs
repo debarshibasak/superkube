@@ -447,3 +447,34 @@ pub fn clusterrolebinding_row(b: &ClusterRoleBinding) -> Vec<Value> {
         json!(age_str(b.metadata.creation_timestamp)),
     ]
 }
+
+// --- Role / RoleBinding (namespaced) -----------------------------------
+
+pub const ROLE_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Created At", "string"),
+];
+
+pub fn role_row(r: &Role) -> Vec<Value> {
+    let created = r
+        .metadata
+        .creation_timestamp
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    vec![json!(r.metadata.name()), json!(created)]
+}
+
+pub const ROLEBINDING_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Role", "string"),
+    Column::new("Age", "string"),
+];
+
+pub fn rolebinding_row(b: &RoleBinding) -> Vec<Value> {
+    let role = format!("{}/{}", b.role_ref.kind, b.role_ref.name);
+    vec![
+        json!(b.metadata.name()),
+        json!(role),
+        json!(age_str(b.metadata.creation_timestamp)),
+    ]
+}

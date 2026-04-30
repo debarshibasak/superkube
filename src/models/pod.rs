@@ -176,16 +176,17 @@ pub struct PodStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<PodCondition>>,
 
-    /// IP address of the pod
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// IP address of the pod. Kubernetes spells it `podIP` on the wire (not
+    /// `podIp`); kubectl's jsonpath / printers all key off that exact spelling.
+    #[serde(default, rename = "podIP", skip_serializing_if = "Option::is_none")]
     pub pod_ip: Option<String>,
 
-    /// IP addresses of the pod (for dual-stack)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// IP addresses of the pod (for dual-stack).
+    #[serde(default, rename = "podIPs", skip_serializing_if = "Option::is_none")]
     pub pod_i_ps: Option<Vec<PodIP>>,
 
-    /// IP address of the host
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// IP address of the host node.
+    #[serde(default, rename = "hostIP", skip_serializing_if = "Option::is_none")]
     pub host_ip: Option<String>,
 
     /// Time when the pod was started
@@ -257,8 +258,11 @@ pub struct ContainerStatus {
     pub ready: bool,
     pub restart_count: i32,
     pub image: String,
+    /// k8s spells this `imageID` on the wire (not `imageId`).
+    #[serde(rename = "imageID")]
     pub image_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// k8s spells this `containerID` on the wire.
+    #[serde(default, rename = "containerID", skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<ContainerState>,
@@ -308,7 +312,7 @@ pub struct ContainerStateTerminated {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "containerID", skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
 }
 

@@ -58,6 +58,11 @@ pub struct ContainerInfo {
     pub restart_count: i32,
     pub started_at: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+    /// Real network address the container reachable on. For Docker this is
+    /// the address inside Docker's bridge VM (e.g. `172.17.0.5`). The agent
+    /// stamps this on `pod.status.podIP` so kubectl/exec see the address that
+    /// other containers actually route to.
+    pub ip: Option<String>,
     /// Ports the runtime has published to the host. Empty if the runtime
     /// doesn't do port publishing (e.g. the in-memory mock).
     pub port_mappings: Vec<PortMapping>,

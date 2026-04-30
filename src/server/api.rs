@@ -17,8 +17,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessag
 use crate::db::{
     ClusterRoleBindingRepository, ClusterRoleRepository, ConfigMapRepository,
     DaemonSetRepository, DeploymentRepository, EndpointsRepository, EventRepository,
-    NamespaceRepository, NodeRepository, PodRepository, SecretRepository, ServiceAccountRepository,
-    ServiceRepository, StatefulSetRepository,
+    NamespaceRepository, NodeRepository, PodRepository, RoleBindingRepository, RoleRepository,
+    SecretRepository, ServiceAccountRepository, ServiceRepository, StatefulSetRepository,
 };
 use crate::error::Result;
 use crate::models::*;
@@ -1953,6 +1953,10 @@ pub async fn rbac_v1_resources() -> Json<Value> {
         "kind": "APIResourceList",
         "groupVersion": "rbac.authorization.k8s.io/v1",
         "resources": [
+            {"name":"roles","singularName":"role","namespaced":true,
+             "kind":"Role","verbs":["create","delete","get","list","update"]},
+            {"name":"rolebindings","singularName":"rolebinding","namespaced":true,
+             "kind":"RoleBinding","verbs":["create","delete","get","list","update"]},
             {"name":"clusterroles","singularName":"clusterrole","namespaced":false,
              "kind":"ClusterRole","verbs":["create","delete","get","list","update"]},
             {"name":"clusterrolebindings","singularName":"clusterrolebinding","namespaced":false,
@@ -2042,4 +2046,132 @@ pub async fn list_all_replica_sets(
     headers: HeaderMap,
 ) -> Result<Response> {
     Ok(empty_rs_response(&headers))
+}
+
+// ============================================================================
+// Role handlers (namespaced, rbac.authorization.k8s.io/v1)
+// ============================================================================
+
+pub async fn list_roles(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = RoleRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(
+        &headers, "rbac.authorization.k8s.io/v1", "RoleList", items,
+        printers::ROLE_COLUMNS, printers::role_row,
+    ))
+}
+
+pub async fn list_all_roles(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = RoleRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(
+        &headers, "rbac.authorization.k8s.io/v1", "RoleList", items,
+        printers::ROLE_COLUMNS, printers::role_row,
+    ))
+}
+
+pub async fn get_role(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = RoleRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(&headers, item, printers::ROLE_COLUMNS, printers::role_row))
+}
+
+pub async fn create_role(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut r): Json<Role>,
+) -> Result<(StatusCode, Json<Role>)> {
+    if r.metadata.namespace.is_none() { r.metadata.namespace = Some(namespace); }
+    Ok((StatusCode::CREATED, Json(RoleRepository::create(&state.pool, &r).await?)))
+}
+
+pub async fn update_role(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut r): Json<Role>,
+) -> Result<Json<Role>> {
+    r.metadata.namespace = Some(namespace);
+    r.metadata.name = Some(name);
+    Ok(Json(RoleRepository::create(&state.pool, &r).await?))
+}
+
+pub async fn delete_role(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    RoleRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"roles"}})))
+}
+
+// ============================================================================
+// RoleBinding handlers (namespaced)
+// ============================================================================
+
+pub async fn list_role_bindings(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = RoleBindingRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(
+        &headers, "rbac.authorization.k8s.io/v1", "RoleBindingList", items,
+        printers::ROLEBINDING_COLUMNS, printers::rolebinding_row,
+    ))
+}
+
+pub async fn list_all_role_bindings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = RoleBindingRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(
+        &headers, "rbac.authorization.k8s.io/v1", "RoleBindingList", items,
+        printers::ROLEBINDING_COLUMNS, printers::rolebinding_row,
+    ))
+}
+
+pub async fn get_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = RoleBindingRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(&headers, item, printers::ROLEBINDING_COLUMNS, printers::rolebinding_row))
+}
+
+pub async fn create_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut b): Json<RoleBinding>,
+) -> Result<(StatusCode, Json<RoleBinding>)> {
+    if b.metadata.namespace.is_none() { b.metadata.namespace = Some(namespace); }
+    Ok((StatusCode::CREATED, Json(RoleBindingRepository::create(&state.pool, &b).await?)))
+}
+
+pub async fn update_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut b): Json<RoleBinding>,
+) -> Result<Json<RoleBinding>> {
+    b.metadata.namespace = Some(namespace);
+    b.metadata.name = Some(name);
+    Ok(Json(RoleBindingRepository::create(&state.pool, &b).await?))
+}
+
+pub async fn delete_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    RoleBindingRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"rolebindings"}})))
 }

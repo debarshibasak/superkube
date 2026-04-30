@@ -1,5 +1,7 @@
+mod lease;
 mod repository;
 
+pub use lease::{Backend, LeaseManager};
 pub use repository::*;
 
 use sqlx::any::{install_default_drivers, AnyPoolOptions};

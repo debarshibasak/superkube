@@ -40,8 +40,8 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_cidr: Option<String>,
 
-    /// Provider-specific node ID
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Provider-specific node ID. k8s spells this `providerID`.
+    #[serde(default, rename = "providerID", skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
 
     /// If set, pods won't be scheduled on this node
@@ -156,11 +156,11 @@ pub enum NodeAddressType {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSystemInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "machineID", skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "systemUUID", skip_serializing_if = "Option::is_none")]
     pub system_uuid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "bootID", skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,

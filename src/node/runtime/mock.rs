@@ -123,6 +123,7 @@ impl Runtime for ContainerdRuntime {
             restart_count: 0,
             started_at: Some(c.started_at),
             exit_code: None,
+            ip: None,
             port_mappings: Vec::new(),
         }))
     }
