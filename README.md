@@ -1,293 +1,258 @@
-# Kais
+# Superkube
 
-A minimal Kubernetes-like container orchestration platform written in Rust.
+A minimal, single-binary Kubernetes-compatible control plane in Rust.
+
+`superkube server` boots the API server **and** registers the host as a node — one process, one binary, real containers running through Docker (macOS) or libcontainer (Linux), accessible from real `kubectl`.
+
+## What works
+
+- **kubectl-shaped API**: discovery, table responses, `cluster-info`, `get all`, `describe`, `logs -f`, `exec`, `port-forward`.
+- **Workloads**: Pods, Deployments, StatefulSets, DaemonSets — each with their own controller loop.
+- **Networking**: Services (ClusterIP, NodePort, LoadBalancer), Endpoints; a userspace NodePort proxy on every node forwards to local pods.
+- **Configuration**: ServiceAccount, Secret, ConfigMap.
+- **RBAC (storage only)**: ClusterRole, ClusterRoleBinding.
+- **Scheduling**: `nodeSelector`, full node affinity (`In`/`NotIn`/`Exists`/`DoesNotExist`/`Gt`/`Lt`), pod affinity / anti-affinity with topology keys.
+- **Observability**: Events emitted by the controllers, scheduler, and node agent.
+- **Storage**: SQLite (default, zero-setup) or PostgreSQL — same schema, picked by `--db-url`.
+
+Most of `kubectl get/apply/delete/describe/logs/exec/port-forward/cluster-info` works against this server with stock `kubectl`.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           CONTROL PLANE (kais server)                        │
-│                                                                             │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
-│  │   API Server     │  │    Controller    │  │    Scheduler     │          │
-│  │     (axum)       │  │     Manager      │  │                  │          │
-│  │                  │  │                  │  │                  │          │
-│  │ • REST API       │  │ • Deployment     │  │ • Pod binding    │          │
-│  │ • kubectl compat │  │   controller     │  │ • Node selection │          │
-│  │ • CRUD ops       │  │ • Service        │  │ • Filtering      │          │
-│  │                  │  │   controller     │  │                  │          │
-│  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘          │
-│           │                     │                     │                     │
-│           └─────────────────────┼─────────────────────┘                     │
-│                                 │                                           │
-│                          ┌──────▼──────┐                                    │
-│                          │  PostgreSQL │                                    │
-│                          │             │                                    │
-│                          │ • Pods      │                                    │
-│                          │ • Deploys   │                                    │
-│                          │ • Services  │                                    │
-│                          │ • Nodes     │                                    │
-│                          │ • Endpoints │                                    │
-│                          └─────────────┘                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    │ HTTP/REST
-                    ┌───────────────┼───────────────┐
-                    │               │               │
-                    ▼               ▼               ▼
-┌─────────────────────────┐ ┌─────────────────────────┐ ┌─────────────────────────┐
-│     NODE 1              │ │     NODE 2              │ │     NODE N              │
-│   (kais node)           │ │   (kais node)           │ │   (kais node)           │
-│                         │ │                         │ │                         │
-│  ┌───────────────────┐  │ │  ┌───────────────────┐  │ │  ┌───────────────────┐  │
-│  │   Node Agent      │  │ │  │   Node Agent      │  │ │  │   Node Agent      │  │
-│  │                   │  │ │  │                   │  │ │  │                   │  │
-│  │ • Registration    │  │ │  │ • Registration    │  │ │  │ • Registration    │  │
-│  │ • Heartbeat       │  │ │  │ • Heartbeat       │  │ │  │ • Heartbeat       │  │
-│  │ • Pod sync        │  │ │  │ • Pod sync        │  │ │  │ • Pod sync        │  │
-│  │ • Status report   │  │ │  │ • Status report   │  │ │  │ • Status report   │  │
-│  └─────────┬─────────┘  │ │  └─────────┬─────────┘  │ │  └─────────┬─────────┘  │
-│            │            │ │            │            │ │            │            │
-│  ┌─────────▼─────────┐  │ │  ┌─────────▼─────────┐  │ │  ┌─────────▼─────────┐  │
-│  │   containerd      │  │ │  │   containerd      │  │ │  │   containerd      │  │
-│  └───────────────────┘  │ │  └───────────────────┘  │ │  └───────────────────┘  │
-│            │            │ │            │            │ │            │            │
-│  ┌─────────▼─────────┐  │ │  ┌─────────▼─────────┐  │ │  ┌─────────▼─────────┐  │
-│  │    Containers     │  │ │  │    Containers     │  │ │  │    Containers     │  │
-│  │  ┌───┐ ┌───┐      │  │ │  │  ┌───┐ ┌───┐      │  │ │  │  ┌───┐ ┌───┐      │  │
-│  │  │Pod│ │Pod│ ...  │  │ │  │  │Pod│ │Pod│ ...  │  │ │  │  │Pod│ │Pod│ ...  │  │
-│  │  └───┘ └───┘      │  │ │  │  └───┘ └───┘      │  │ │  │  └───┘ └───┘      │  │
-│  └───────────────────┘  │ │  └───────────────────┘  │ │  └───────────────────┘  │
-└─────────────────────────┘ └─────────────────────────┘ └─────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  CONTROL PLANE  (superkube server)                      │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────┐              │
+│  │  API server  │  │   Controllers    │  │  Scheduler   │              │
+│  │   (axum)     │  │ Deployment / SS  │  │ + node-affty │              │
+│  │              │  │   DS / Pod /     │  │ + pod-affty  │              │
+│  │              │  │   Service /      │  │              │              │
+│  │              │  │   Endpoints      │  │              │              │
+│  └──────┬───────┘  └────────┬─────────┘  └──────┬───────┘              │
+│         │                   │                   │                       │
+│         └───────────────────┼───────────────────┘                       │
+│                             │                                           │
+│                  ┌──────────▼──────────┐                                │
+│                  │  SQLite or Postgres │                                │
+│                  └─────────────────────┘                                │
+│                                                                         │
+│  ┌────────────────────  embedded node agent  ────────────────────────┐  │
+│  │ registers the server's host as a control-plane node automatically │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   │  HTTP / WebSocket
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  NODE AGENT  (superkube node, optional)                 │
+│                                                                         │
+│  Heartbeat / pod sync / NodePort proxy / log + exec relay               │
+│                                                                         │
+│  Runtime selector:                                                      │
+│    macOS → Docker (bollard → /var/run/docker.sock)                      │
+│    Linux → embedded (oci-distribution + libcontainer)                   │
+│    any   → mock (in-memory, for tests)                                  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Features
-
-- **kubectl Compatible**: Full compatibility with kubectl commands
-- **Namespaces**: Resource isolation and organization
-- **Deployments**: Declarative pod management with replica scaling
-- **Services**: ClusterIP and NodePort service types
-- **Pods**: Container lifecycle management
-- **Nodes**: Worker node registration and health monitoring
-- **PostgreSQL or SQLite Backend**: Durable state storage (instead of etcd) — use Postgres for clusters, SQLite for single-node/dev
-- **containerd Runtime**: Native container runtime integration
-
-## Components
-
-### Control Plane (`kais server`)
-
-| Component | Description |
-|-----------|-------------|
-| **API Server** | RESTful API compatible with Kubernetes API |
-| **Controller Manager** | Reconciles deployments and services |
-| **Scheduler** | Assigns pods to available nodes |
-
-### Node Agent (`kais node`)
-
-| Component | Description |
-|-----------|-------------|
-| **Node Agent** | Registers node, syncs pods, reports status |
-| **Runtime** | containerd interface for container management |
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.75+
 - One of:
-    - PostgreSQL 14+ (recommended for clusters)
-    - SQLite 3.24+ (great for single-node / dev — nothing extra to install)
-- containerd (for node agent)
+    - **macOS**: Docker Desktop running (the embedded node agent talks to its socket)
+    - **Linux**: a kernel with cgroups v2 + namespaces (any modern distro); `libseccomp` headers if you build with seccomp enabled
+- `kubectl` ≥1.27 if you want to drive it
 
-### 1. Pick a database
-
-**Option A — SQLite (zero setup):** skip ahead, the file is created on first start.
-
-**Option B — PostgreSQL:**
-
-```bash
-docker-compose up -d postgres
-```
-
-### 2. Build Kais
+### Build and run
 
 ```bash
 cargo build --release
+
+# Single command — server + embedded node agent + control-plane registration.
+./target/release/superkube server
 ```
 
-### 3. Start Control Plane
-
-Migrations run automatically on server startup. If `--db-url` is omitted, kais defaults to a local SQLite file (`./kais.db`) and creates it on first start:
+That's it. The first run creates `./superkube.db` (SQLite), starts the API on `:6443`, and the embedded agent registers the host:
 
 ```bash
-# Zero-config: defaults to sqlite://./kais.db
-./target/release/kais server --port 6443
-
-# Explicit SQLite
-./target/release/kais server --db-url sqlite://./kais.db --port 6443
-
-# PostgreSQL
-./target/release/kais server --db-url postgres://kais:kais@localhost/kais --port 6443
+$ kubectl --server=http://localhost:6443 get nodes
+NAME                    STATUS   ROLES           AGE   VERSION
+Debarshis-MacBook-Pro   Ready    control-plane   3s    superkube/0.1.0
 ```
 
-### 4. Start Node Agent
+### kubectl
 
 ```bash
-./target/release/kais node --name worker-1 --server http://localhost:6443
-```
+# (optional) wire up a kubeconfig once
+cat > ~/.kube/superkube.yaml <<'EOF'
+apiVersion: v1
+kind: Config
+clusters: [{name: superkube, cluster: {server: http://localhost:6443}}]
+contexts: [{name: superkube, context: {cluster: superkube, user: superkube}}]
+users:    [{name: superkube, user: {}}]
+current-context: superkube
+EOF
+export KUBECONFIG=~/.kube/superkube.yaml
 
-### 5. Use kubectl
-
-```bash
-# Configure kubectl
-export KUBECONFIG=/dev/null
-alias kubectl='kubectl --server http://localhost:6443'
-
-# List nodes
-kubectl get nodes
-
-# Create a deployment
-kubectl apply -f - <<EOF
+kubectl apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nginx
 spec:
   replicas: 3
-  selector:
-    matchLabels:
-      app: nginx
+  selector: {matchLabels: {app: nginx}}
   template:
-    metadata:
-      labels:
-        app: nginx
+    metadata: {labels: {app: nginx}}
     spec:
       containers:
-      - name: nginx
-        image: nginx:latest
-        ports:
-        - containerPort: 80
+        - name: nginx
+          image: nginx:latest
+          ports: [{containerPort: 80}]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
 EOF
 
-# List pods
-kubectl get pods
-
-# Create a service
-kubectl apply -f - <<EOF
+kubectl apply -f - <<'EOF'
 apiVersion: v1
 kind: Service
-metadata:
-  name: nginx
+metadata: {name: nginx}
 spec:
   type: NodePort
-  selector:
-    app: nginx
-  ports:
-  - port: 80
-    targetPort: 80
+  selector: {app: nginx}
+  ports: [{port: 80, targetPort: 80, nodePort: 31080}]
 EOF
 
-# List services
-kubectl get services
-
-# Create a namespace
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: production
-EOF
-
-# List namespaces
-kubectl get namespaces
-
-# Create resources in a namespace
-kubectl -n production apply -f deployment.yaml
-
-# Delete a namespace (also deletes all resources in it)
-kubectl delete namespace production
+kubectl get all                # pods, deployments, services, RS/RC stubs
+kubectl logs -f <pod>          # streams from Docker
+kubectl exec -it <pod> -- sh   # interactive shell inside the container
+curl http://localhost:31080/   # NodePort proxy → real nginx
 ```
 
-## API Endpoints
+### Adding more nodes (multi-host)
 
-### Core API (v1)
-
-| Endpoint | Methods | Description |
-|----------|---------|-------------|
-| `/api/v1/namespaces` | GET, POST | List/create namespaces |
-| `/api/v1/namespaces/{name}` | GET, PUT, DELETE | Get/update/delete namespace |
-| `/api/v1/namespaces/{ns}/pods` | GET, POST | List/create pods |
-| `/api/v1/namespaces/{ns}/pods/{name}` | GET, PUT, DELETE | Get/update/delete pod |
-| `/api/v1/namespaces/{ns}/services` | GET, POST | List/create services |
-| `/api/v1/namespaces/{ns}/services/{name}` | GET, PUT, DELETE | Get/update/delete service |
-| `/api/v1/nodes` | GET, POST | List/create nodes |
-| `/api/v1/nodes/{name}` | GET, PUT, DELETE | Get/update/delete node |
-
-### Apps API (v1)
-
-| Endpoint | Methods | Description |
-|----------|---------|-------------|
-| `/apis/apps/v1/namespaces/{ns}/deployments` | GET, POST | List/create deployments |
-| `/apis/apps/v1/namespaces/{ns}/deployments/{name}` | GET, PUT, DELETE | Get/update/delete deployment |
-
-## Database Schema
-
-```sql
--- Core tables
-namespaces      -- Namespace definitions
-nodes           -- Worker node registry
-pods            -- Pod specifications and status
-deployments     -- Deployment specifications
-services        -- Service definitions
-endpoints       -- Service endpoint mappings
+```bash
+# On any other host with Docker:
+./target/release/superkube node --server http://<server-host>:6443
+# (--name defaults to the host's hostname)
 ```
 
-## Project Structure
+## CLI
+
+### `superkube server`
+
+| Flag | Env | Default | Notes |
+|------|-----|---------|-------|
+| `--db-url` | `DATABASE_URL` | `sqlite://./superkube.db` | Postgres also supported: `postgres://user:pass@host/db` |
+| `--host` | — | `0.0.0.0` | Bind address |
+| `--port` | — | `6443` | API server port |
+| `--pod-cidr` | — | `10.244.0.0/16` | First /24 used by the embedded agent for pod IPs |
+| `--service-cidr` | — | `10.96.0.0/12` | First /24 used to auto-assign ClusterIPs |
+
+Server boots the API + an embedded node agent that registers the host as the control-plane node. No separate `superkube node` invocation is needed for a single-host cluster.
+
+### `superkube node`
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--server` | — required | URL of the superkube control plane |
+| `--name` | host's short hostname | Node name |
+| `--runtime` | `auto` | `auto` / `docker` / `embedded` / `mock` |
+| `--containerd-socket` | `/run/containerd/containerd.sock` | only used by the mock runtime placeholder |
+
+`--runtime=auto` picks Docker on macOS, the embedded libcontainer runtime on Linux, otherwise the mock.
+
+## Container runtimes
+
+| Backend | Where | What it talks to | Status |
+|---------|-------|------------------|--------|
+| `docker` | macOS, Linux | `/var/run/docker.sock` via `bollard` | Production-ready: pull / create / start / inspect / logs (live stream) / exec / port publishing for NodePort. |
+| `embedded` | Linux only | youki's `libcontainer` crate, in-process | Skeleton: image pull (`oci-distribution`) → bundle build (our `oci/bundle.rs`) → `libcontainer::ContainerBuilder.start()`. **TODO:** networking (no veth/bridge yet), log capture, exec. |
+| `mock` | any | nothing | In-memory stub for tests / dev without a runtime. |
+
+The embedded path is the answer to "single static binary, no host daemon" on Linux: `superkube node --runtime=embedded` pulls images itself and hands the OCI bundle to libcontainer for namespaces / cgroups v2 / pivot_root.
+
+## Resources
+
+| Group/Version | Kinds | Notes |
+|---------------|-------|-------|
+| `v1` | Pod, Service, Endpoints, Node, Namespace, Event, ServiceAccount, Secret, ConfigMap | Pods/Services run real workloads; SA/Secret/CM are storage-only. |
+| `v1` | ReplicationController | Stub (empty list). Exists so `kubectl get all` doesn't 404. |
+| `apps/v1` | Deployment, StatefulSet, DaemonSet | Each has its own reconciliation loop; pods are owned directly. |
+| `apps/v1` | ReplicaSet | Stub (empty list). Deployments don't materialize ReplicaSets here. |
+| `rbac.authorization.k8s.io/v1` | ClusterRole, ClusterRoleBinding | Stored only — no enforcement. |
+
+## Storage
+
+One portable schema across both backends.
 
 ```
-kais/
+namespaces / nodes / pods / deployments / services / endpoints
+events / serviceaccounts / secrets / configmaps
+clusterroles / clusterrolebindings
+statefulsets / daemonsets
+```
+
+JSON spec/labels/annotations stored as `TEXT`; UUIDs and timestamps as ISO strings. Migrations run on every server start.
+
+## Project layout
+
+```
+.
 ├── Cargo.toml
-├── src/
-│   ├── main.rs           # CLI entry point
-│   ├── lib.rs
-│   ├── error.rs          # Error types
-│   ├── models/           # K8s resource types
-│   │   ├── namespace.rs
-│   │   ├── pod.rs
-│   │   ├── deployment.rs
-│   │   ├── service.rs
-│   │   └── node.rs
-│   ├── db/               # PostgreSQL layer
-│   │   └── repository.rs
-│   ├── server/           # Control plane
-│   │   ├── api.rs
-│   │   ├── controller.rs
-│   │   └── scheduler.rs
-│   └── node/             # Node agent
-│       ├── agent.rs
-│       └── runtime.rs
-├── migrations/
-│   └── 001_initial.sql
-└── docker-compose.yml
+├── README.md
+├── docker-compose.yml         # Postgres for testing, optional
+├── migrations/                # *.sql, run on startup
+└── src/
+    ├── main.rs                # CLI entry point
+    ├── lib.rs
+    ├── util.rs                # detect_hostname, etc.
+    ├── error.rs
+    ├── models/                # Kubernetes API types
+    │   ├── pod.rs daemonset.rs deployment.rs statefulset.rs
+    │   ├── service.rs node.rs namespace.rs event.rs
+    │   ├── auth.rs            # SA / Secret / ConfigMap / ClusterRole(Binding)
+    │   ├── affinity.rs        # node + pod (anti-)affinity types
+    │   └── meta.rs            # ObjectMeta, LabelSelector, ...
+    ├── db/                    # sqlx::Any layer — works on Postgres + SQLite
+    │   ├── mod.rs
+    │   └── repository.rs
+    ├── server/                # control plane
+    │   ├── api.rs             # all HTTP handlers
+    │   ├── routes.rs          # axum router
+    │   ├── controller.rs      # reconciliation loops + event recorder
+    │   ├── scheduler.rs       # nodeSelector + node/pod affinity
+    │   ├── table.rs           # kubectl Table response builder
+    │   ├── printers.rs        # column defs per resource kind
+    │   └── mod.rs             # spawns embedded node agent
+    └── node/
+        ├── agent.rs           # heartbeat, pod reconcile, log/exec relay
+        ├── proxy.rs           # NodePort userspace proxy
+        ├── runtime/
+        │   ├── mod.rs         # Runtime trait + selector
+        │   ├── mock.rs        # in-memory stub
+        │   ├── docker.rs      # bollard-backed (macOS + Linux)
+        │   └── embedded.rs    # libcontainer-backed (Linux only)
+        └── oci/               # cross-platform pieces of the embedded path
+            ├── image.rs       # oci-distribution → unpacked rootfs
+            └── bundle.rs      # OCI runtime spec from a Pod container
 ```
 
-## Configuration
+## Known caveats
 
-### Server Options
+- **`kubectl apply` on existing objects** uses HTTP `PATCH`, which we don't implement yet. First-time apply (PUT/POST) works; re-applying a changed resource currently fails with `MethodNotAllowed`. Workarounds: `kubectl replace -f file.yaml --force`, or `delete` + `apply`.
+- **Embedded runtime**: skeleton only — image pull and libcontainer wiring are in place, but pod networking, log capture, and exec aren't yet hooked up. On Linux today, `--runtime=docker` is the productive choice.
+- **No CNI**: pod IPs are assigned from `--pod-cidr` (default `10.244.0.0/16`) but pod-to-pod connectivity isn't wired. Service traffic works because the NodePort proxy connects to the host port that Docker publishes for each container.
+- **No RBAC enforcement**: ClusterRole/Binding objects round-trip through the API but are not consulted at request time. The API has no auth.
+- **OpenAPI schemas** aren't generated. We serve a benign empty `/openapi/v2` (zero bytes, parses as an empty protobuf `Document`) and an empty `/openapi/v3` JSON, so kubectl validation passes without `--validate=false`.
 
-| Flag | Environment | Default | Description |
-|------|-------------|---------|-------------|
-| `--db-url` | `DATABASE_URL` | `sqlite://./kais.db` | Database URL — `postgres://...` or `sqlite://path/to/file.db` (also accepts `sqlite::memory:`) |
-| `--port` | - | `6443` | API server port |
-| `--host` | - | `0.0.0.0` | Bind address |
+## Status
 
-### Node Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name` | - | Node name (required) |
-| `--server` | - | API server URL (required) |
-| `--containerd-socket` | `/run/containerd/containerd.sock` | containerd socket path |
+Hobby project — built incrementally. The pieces above all work end-to-end on macOS through Docker Desktop; the Linux embedded path compiles but needs a Linux box to actually exercise.
 
 ## License
 
