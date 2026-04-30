@@ -69,7 +69,7 @@ A minimal Kubernetes-like container orchestration platform written in Rust.
 - **Services**: ClusterIP and NodePort service types
 - **Pods**: Container lifecycle management
 - **Nodes**: Worker node registration and health monitoring
-- **PostgreSQL Backend**: Durable state storage (instead of etcd)
+- **PostgreSQL or SQLite Backend**: Durable state storage (instead of etcd) — use Postgres for clusters, SQLite for single-node/dev
 - **containerd Runtime**: Native container runtime integration
 
 ## Components
@@ -94,10 +94,16 @@ A minimal Kubernetes-like container orchestration platform written in Rust.
 ### Prerequisites
 
 - Rust 1.70+
-- PostgreSQL 14+
+- One of:
+    - PostgreSQL 14+ (recommended for clusters)
+    - SQLite 3.24+ (great for single-node / dev — nothing extra to install)
 - containerd (for node agent)
 
-### 1. Start PostgreSQL
+### 1. Pick a database
+
+**Option A — SQLite (zero setup):** skip ahead, the file is created on first start.
+
+**Option B — PostgreSQL:**
 
 ```bash
 docker-compose up -d postgres
@@ -111,9 +117,16 @@ cargo build --release
 
 ### 3. Start Control Plane
 
-Migrations run automatically on server startup.
+Migrations run automatically on server startup. If `--db-url` is omitted, kais defaults to a local SQLite file (`./kais.db`) and creates it on first start:
 
 ```bash
+# Zero-config: defaults to sqlite://./kais.db
+./target/release/kais server --port 6443
+
+# Explicit SQLite
+./target/release/kais server --db-url sqlite://./kais.db --port 6443
+
+# PostgreSQL
 ./target/release/kais server --db-url postgres://kais:kais@localhost/kais --port 6443
 ```
 
@@ -264,7 +277,7 @@ kais/
 
 | Flag | Environment | Default | Description |
 |------|-------------|---------|-------------|
-| `--db-url` | `DATABASE_URL` | - | PostgreSQL connection URL |
+| `--db-url` | `DATABASE_URL` | `sqlite://./kais.db` | Database URL — `postgres://...` or `sqlite://path/to/file.db` (also accepts `sqlite::memory:`) |
 | `--port` | - | `6443` | API server port |
 | `--host` | - | `0.0.0.0` | Bind address |
 

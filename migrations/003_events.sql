@@ -1,49 +1,49 @@
--- Events table for Kubernetes-compatible events
-CREATE TABLE events (
-    uid UUID PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    namespace VARCHAR(255) NOT NULL DEFAULT 'default',
+-- Events table (portable: PostgreSQL + SQLite)
+CREATE TABLE IF NOT EXISTS events (
+    uid TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    namespace TEXT NOT NULL DEFAULT 'default',
 
     -- Involved object reference
-    involved_object_api_version VARCHAR(255),
-    involved_object_kind VARCHAR(255),
-    involved_object_name VARCHAR(255),
-    involved_object_namespace VARCHAR(255),
-    involved_object_uid VARCHAR(255),
-    involved_object_resource_version VARCHAR(255),
+    involved_object_api_version TEXT,
+    involved_object_kind TEXT,
+    involved_object_name TEXT,
+    involved_object_namespace TEXT,
+    involved_object_uid TEXT,
+    involved_object_resource_version TEXT,
     involved_object_field_path TEXT,
 
     -- Event details
-    reason VARCHAR(255),
+    reason TEXT,
     message TEXT,
 
     -- Source
-    source_component VARCHAR(255),
-    source_host VARCHAR(255),
+    source_component TEXT,
+    source_host TEXT,
 
-    -- Timestamps
-    first_timestamp TIMESTAMPTZ,
-    last_timestamp TIMESTAMPTZ,
-    event_time TIMESTAMPTZ,
+    -- Timestamps (ISO 8601 strings)
+    first_timestamp TEXT,
+    last_timestamp TEXT,
+    event_time TEXT,
 
     -- Count for duplicate events
-    count INT DEFAULT 1,
+    count INTEGER DEFAULT 1,
 
     -- Event type: Normal or Warning
-    event_type VARCHAR(50) DEFAULT 'Normal',
+    event_type TEXT DEFAULT 'Normal',
 
     -- Action and reporting
-    action VARCHAR(255),
-    reporting_controller VARCHAR(255),
-    reporting_instance VARCHAR(255),
+    action TEXT,
+    reporting_controller TEXT,
+    reporting_instance TEXT,
 
-    -- Standard metadata timestamps
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    -- Standard metadata timestamps (ISO 8601 strings)
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    UNIQUE(name, namespace)
 );
 
--- Index for efficient queries
-CREATE INDEX idx_events_namespace ON events(namespace);
-CREATE INDEX idx_events_involved_object ON events(involved_object_kind, involved_object_name, involved_object_namespace);
-CREATE INDEX idx_events_last_timestamp ON events(last_timestamp DESC);
-CREATE INDEX idx_events_name_namespace ON events(name, namespace);
+CREATE INDEX IF NOT EXISTS idx_events_namespace ON events(namespace);
+CREATE INDEX IF NOT EXISTS idx_events_involved_object ON events(involved_object_kind, involved_object_name, involved_object_namespace);
+CREATE INDEX IF NOT EXISTS idx_events_last_timestamp ON events(last_timestamp);

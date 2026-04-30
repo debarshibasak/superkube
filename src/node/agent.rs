@@ -1,13 +1,11 @@
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse,
-    },
+    http::{HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -26,27 +24,39 @@ use uuid::Uuid;
 
 use crate::models::*;
 
-use super::runtime::{ContainerdRuntime, LogOptions};
+use super::runtime::{self, LogOptions, PortMapping, Runtime};
 
 /// Node agent HTTP server port
 const NODE_AGENT_PORT: u16 = 10250;
 
-/// Run the node agent
-pub async fn run(name: &str, server_url: &str, containerd_socket: &str) -> anyhow::Result<()> {
-    let agent = NodeAgent::new(name, server_url, containerd_socket).await?;
+/// Run the node agent. `labels` are attached to the registered Node object —
+/// pass `node-role.kubernetes.io/control-plane=""` for the embedded server-side
+/// agent so kubectl shows it under the `control-plane` role.
+pub async fn run(
+    name: &str,
+    server_url: &str,
+    containerd_socket: &str,
+    labels: HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let agent = NodeAgent::new(name, server_url, containerd_socket, labels).await?;
     agent.run().await
 }
 
 /// Shared state for the node agent
-struct AgentState {
-    name: String,
-    server_url: String,
-    client: Client,
-    runtime: ContainerdRuntime,
+pub(super) struct AgentState {
+    pub name: String,
+    pub labels: HashMap<String, String>,
+    pub server_url: String,
+    pub client: Client,
+    pub runtime: Box<dyn Runtime>,
     /// Map of pod UID to container ID
-    containers: HashMap<Uuid, String>,
+    pub containers: HashMap<Uuid, String>,
     /// Map of (namespace, pod_name, container_name) to container ID for log lookup
-    pod_containers: HashMap<(String, String, String), String>,
+    pub pod_containers: HashMap<(String, String, String), String>,
+    /// Map of (namespace, pod_name) → published port mappings from the runtime.
+    /// Read by the NodePort proxy to find a local backend host port for an
+    /// endpoint pod hosted on this node.
+    pub pod_ports: HashMap<(String, String), Vec<PortMapping>>,
 }
 
 /// Node agent that manages containers on this node
@@ -55,16 +65,24 @@ struct NodeAgent {
 }
 
 impl NodeAgent {
-    async fn new(name: &str, server_url: &str, containerd_socket: &str) -> anyhow::Result<Self> {
-        let runtime = ContainerdRuntime::new(containerd_socket).await?;
+    async fn new(
+        name: &str,
+        server_url: &str,
+        containerd_socket: &str,
+        labels: HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let runtime = runtime::default(containerd_socket).await?;
+        tracing::info!("node agent runtime: {}", runtime.name());
 
         let state = AgentState {
             name: name.to_string(),
+            labels,
             server_url: server_url.trim_end_matches('/').to_string(),
             client: Client::new(),
             runtime,
             containers: HashMap::new(),
             pod_containers: HashMap::new(),
+            pod_ports: HashMap::new(),
         };
 
         Ok(Self {
@@ -84,6 +102,14 @@ impl NodeAgent {
                 tracing::error!("HTTP server error: {}", e);
             }
         });
+
+        // Start the NodePort service proxy.
+        let server_url = self.state.read().await.server_url.clone();
+        let proxy = super::proxy::ServiceProxy::new(self.state.clone(), server_url);
+        let proxy_handle = tokio::spawn(async move {
+            proxy.run().await;
+        });
+        let _ = proxy_handle;
 
         // Start heartbeat and pod sync loops
         let mut heartbeat_interval = interval(Duration::from_secs(10));
@@ -110,7 +136,7 @@ impl NodeAgent {
         let state = self.state.read().await;
         tracing::info!("Registering node {} with server", state.name);
 
-        let node = build_node_object(&state.name);
+        let node = build_node_object(&state.name, &state.labels);
 
         let response = state
             .client
@@ -133,7 +159,7 @@ impl NodeAgent {
     /// Send heartbeat to update node status
     async fn send_heartbeat(&self) -> anyhow::Result<()> {
         let state = self.state.read().await;
-        let node = build_node_object(&state.name);
+        let node = build_node_object(&state.name, &state.labels);
 
         let response = state
             .client
@@ -194,113 +220,314 @@ impl NodeAgent {
         Ok(())
     }
 
-    /// Reconcile a single pod - ensure containers are running
+    /// Reconcile a single pod — observe runtime state, create missing
+    /// containers, then publish a fresh `PodStatus` (including
+    /// `containerStatuses`, which is what kubectl uses for the READY column).
     async fn reconcile_pod(&self, pod: &Pod) -> anyhow::Result<()> {
-        let pod_uid = pod.metadata.uid.ok_or_else(|| anyhow::anyhow!("Pod has no UID"))?;
+        let pod_uid = pod
+            .metadata
+            .uid
+            .ok_or_else(|| anyhow::anyhow!("Pod has no UID"))?;
         let namespace = pod.metadata.namespace().to_string();
         let pod_name = pod.metadata.name().to_string();
 
-        let current_phase = pod
-            .status
-            .as_ref()
-            .map(|s| s.phase.clone())
-            .unwrap_or(PodPhase::Pending);
-
-        let mut state = self.state.write().await;
-
-        // If pod is already running or terminated, check status
-        if state.containers.contains_key(&pod_uid) {
-            let container_id = state.containers.get(&pod_uid).unwrap().clone();
-
-            // Check if container is still running
-            let is_running = state.runtime.is_container_running(&container_id).await?;
-
-            drop(state);
-
-            if is_running && current_phase != PodPhase::Running {
-                // Update pod status to Running
-                self.update_pod_status(&namespace, &pod_name, PodPhase::Running, None)
-                    .await?;
-            } else if !is_running && current_phase == PodPhase::Running {
-                // Container stopped, update status
-                self.update_pod_status(&namespace, &pod_name, PodPhase::Succeeded, None)
-                    .await?;
-            }
-
+        if pod.spec.containers.is_empty() {
             return Ok(());
         }
 
-        // Pod is not running, start it
-        if current_phase == PodPhase::Pending {
-            tracing::info!("Starting pod {}/{}", namespace, pod_name);
+        let mut container_statuses: Vec<ContainerStatus> = Vec::new();
+        let mut all_running = true;
+        let mut any_failed = false;
+        let mut earliest_start: Option<chrono::DateTime<Utc>> = None;
 
-            // For simplicity, we only start the first container
-            // In a full implementation, we would start all containers
-            if let Some(container) = pod.spec.containers.first() {
-                let container_name_full = format!("{}-{}", pod_name, container.name);
+        // Observe + act per container.
+        for container in &pod.spec.containers {
+            let docker_name = format!("{}-{}", pod_name, container.name);
 
-                match state
-                    .runtime
-                    .create_and_start_container(&container_name_full, &container.image)
-                    .await
-                {
-                    Ok(container_id) => {
-                        tracing::info!(
-                            "Started container {} for pod {}/{}",
-                            container_id,
-                            namespace,
-                            pod_name
-                        );
-                        state.containers.insert(pod_uid, container_id.clone());
-                        state.pod_containers.insert(
-                            (namespace.clone(), pod_name.clone(), container.name.clone()),
-                            container_id,
-                        );
+            // Observe.
+            let mut state = self.state.write().await;
+            let observed = state.runtime.find_container(&docker_name).await?;
 
-                        // Update pod status to Running
-                        // Generate a pod IP (simplified - would use CNI in production)
-                        let pod_ip = format!("10.244.0.{}", (pod_uid.as_u128() % 254 + 1) as u8);
-
-                        drop(state);
-
-                        self.update_pod_status(&namespace, &pod_name, PodPhase::Running, Some(&pod_ip))
-                            .await?;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to start container for pod {}/{}: {}",
-                            namespace,
-                            pod_name,
-                            e
-                        );
-
-                        drop(state);
-
-                        self.update_pod_status(&namespace, &pod_name, PodPhase::Failed, None)
-                            .await?;
+            // Act if missing.
+            let info = match observed {
+                Some(info) => info,
+                None => {
+                    tracing::info!(
+                        "pod {}/{}: starting container {}",
+                        namespace,
+                        pod_name,
+                        container.name
+                    );
+                    drop(state);
+                    self.emit_event(
+                        pod,
+                        EventType::Normal,
+                        "Pulling",
+                        &format!("Pulling image \"{}\"", container.image),
+                    )
+                    .await;
+                    let mut state = self.state.write().await;
+                    match state
+                        .runtime
+                        .create_and_start_container(&docker_name, container)
+                        .await
+                    {
+                        Ok(_id) => {
+                            let info = state
+                                .runtime
+                                .find_container(&docker_name)
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "created container {docker_name} but cannot find it"
+                                    )
+                                })?;
+                            drop(state);
+                            self.emit_event(
+                                pod,
+                                EventType::Normal,
+                                "Pulled",
+                                &format!("Successfully pulled image \"{}\"", container.image),
+                            )
+                            .await;
+                            self.emit_event(
+                                pod,
+                                EventType::Normal,
+                                "Created",
+                                &format!("Created container {}", container.name),
+                            )
+                            .await;
+                            self.emit_event(
+                                pod,
+                                EventType::Normal,
+                                "Started",
+                                &format!("Started container {}", container.name),
+                            )
+                            .await;
+                            // Re-acquire the write lock so the surrounding code
+                            // (state.containers / pod_containers maps) keeps
+                            // working as before.
+                            let mut state = self.state.write().await;
+                            state.containers.insert(pod_uid, info.id.clone());
+                            state.pod_containers.insert(
+                                (
+                                    namespace.clone(),
+                                    pod_name.clone(),
+                                    container.name.clone(),
+                                ),
+                                info.id.clone(),
+                            );
+                            if !info.port_mappings.is_empty() {
+                                state
+                                    .pod_ports
+                                    .entry((namespace.clone(), pod_name.clone()))
+                                    .or_default()
+                                    .extend(info.port_mappings.iter().cloned());
+                            }
+                            drop(state);
+                            // info is needed below for status reporting; clone
+                            // out of the matched arm.
+                            // Use a sentinel: build the ContainerStatus inline
+                            // here rather than fall through.
+                            if info.running {
+                                if let Some(t) = info.started_at {
+                                    earliest_start =
+                                        Some(earliest_start.map_or(t, |cur| cur.min(t)));
+                                }
+                            } else {
+                                all_running = false;
+                                if info.exit_code.unwrap_or(0) != 0 {
+                                    any_failed = true;
+                                }
+                            }
+                            container_statuses.push(ContainerStatus {
+                                name: container.name.clone(),
+                                ready: info.running,
+                                restart_count: info.restart_count,
+                                image: container.image.clone(),
+                                image_id: container.image.clone(),
+                                container_id: Some(info.id.clone()),
+                                state: Some(container_state(&info)),
+                                last_state: None,
+                                started: Some(info.running),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "pod {}/{}: failed to start {}: {}",
+                                namespace,
+                                pod_name,
+                                container.name,
+                                e
+                            );
+                            drop(state);
+                            self.emit_event(
+                                pod,
+                                EventType::Warning,
+                                "Failed",
+                                &format!(
+                                    "Failed to start container {}: {}",
+                                    container.name, e
+                                ),
+                            )
+                            .await;
+                            any_failed = true;
+                            container_statuses.push(failed_container_status(container, &e));
+                            continue;
+                        }
                     }
                 }
+            };
+
+            // Maintain in-memory indexes for log/exec endpoints + the
+            // NodePort proxy.
+            state.containers.insert(pod_uid, info.id.clone());
+            state.pod_containers.insert(
+                (namespace.clone(), pod_name.clone(), container.name.clone()),
+                info.id.clone(),
+            );
+            if !info.port_mappings.is_empty() {
+                state
+                    .pod_ports
+                    .entry((namespace.clone(), pod_name.clone()))
+                    .or_default()
+                    .extend(info.port_mappings.iter().cloned());
             }
+            drop(state);
+
+            if !info.running {
+                all_running = false;
+                if info.exit_code.unwrap_or(0) != 0 {
+                    any_failed = true;
+                }
+            }
+
+            if let Some(t) = info.started_at {
+                earliest_start = Some(earliest_start.map_or(t, |cur| cur.min(t)));
+            }
+
+            container_statuses.push(ContainerStatus {
+                name: container.name.clone(),
+                ready: info.running,
+                restart_count: info.restart_count,
+                image: container.image.clone(),
+                image_id: container.image.clone(),
+                container_id: Some(info.id.clone()),
+                state: Some(container_state(&info)),
+                last_state: None,
+                started: Some(info.running),
+            });
         }
+
+        let phase = if any_failed {
+            PodPhase::Failed
+        } else if all_running && !container_statuses.is_empty() {
+            PodPhase::Running
+        } else {
+            PodPhase::Pending
+        };
+
+        let pod_ip = format!("10.244.0.{}", (pod_uid.as_u128() % 254 + 1) as u8);
+
+        self.publish_pod_status(
+            &namespace,
+            &pod_name,
+            phase,
+            Some(pod_ip),
+            container_statuses,
+            earliest_start,
+        )
+        .await?;
 
         Ok(())
     }
 
-    /// Update pod status on the server
-    async fn update_pod_status(
+    /// Fire-and-forget event POST to the server. Failures are logged at debug —
+    /// events are observability, never something that should fail a reconcile.
+    async fn emit_event(
+        &self,
+        pod: &Pod,
+        typ: EventType,
+        reason: &str,
+        message: &str,
+    ) {
+        let state = self.state.read().await;
+        let namespace = pod.metadata.namespace().to_string();
+        let pod_name = pod.metadata.name().to_string();
+        let now = Utc::now();
+
+        let event_name = format!(
+            "{}.{:x}",
+            pod_name,
+            Uuid::new_v4().as_u128() & 0xFFFFFFFF
+        );
+
+        let event = Event {
+            type_meta: TypeMeta {
+                api_version: Some("v1".to_string()),
+                kind: Some("Event".to_string()),
+            },
+            metadata: ObjectMeta {
+                name: Some(event_name),
+                namespace: Some(namespace.clone()),
+                uid: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+            involved_object: ObjectReference {
+                api_version: Some("v1".to_string()),
+                kind: Some("Pod".to_string()),
+                name: Some(pod_name),
+                namespace: Some(namespace.clone()),
+                uid: pod.metadata.uid,
+                resource_version: None,
+                field_path: None,
+            },
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
+            source: Some(EventSource {
+                component: Some("kubelet".to_string()),
+                host: Some(state.name.clone()),
+            }),
+            first_timestamp: Some(now),
+            last_timestamp: Some(now),
+            event_time: Some(now),
+            count: Some(1),
+            event_type: Some(typ),
+            action: None,
+            reporting_controller: Some("kais/kubelet".to_string()),
+            reporting_instance: Some(state.name.clone()),
+        };
+
+        let url = format!(
+            "{}/api/v1/namespaces/{}/events",
+            state.server_url, namespace
+        );
+        let result = state.client.post(&url).json(&event).send().await;
+        if let Err(e) = result {
+            tracing::debug!("emit_event POST failed: {}", e);
+        }
+    }
+
+    /// Push a fresh PodStatus to the server. The status carries the full
+    /// containerStatuses array so kubectl can render READY / RESTARTS columns.
+    async fn publish_pod_status(
         &self,
         namespace: &str,
         name: &str,
         phase: PodPhase,
-        pod_ip: Option<&str>,
+        pod_ip: Option<String>,
+        container_statuses: Vec<ContainerStatus>,
+        start_time: Option<chrono::DateTime<Utc>>,
     ) -> anyhow::Result<()> {
         let state = self.state.read().await;
 
         let status = PodStatus {
             phase,
-            pod_ip: pod_ip.map(|s| s.to_string()),
+            pod_ip,
             host_ip: Some("127.0.0.1".to_string()),
-            start_time: Some(Utc::now()),
+            start_time: start_time.or_else(|| Some(Utc::now())),
+            container_statuses: Some(container_statuses),
             ..Default::default()
         };
 
@@ -337,13 +564,70 @@ impl NodeAgent {
     }
 }
 
-/// Build the Node object for registration/heartbeat
-fn build_node_object(name: &str) -> Node {
-    let capacity = HashMap::from([
-        ("cpu".to_string(), "4".to_string()),
-        ("memory".to_string(), "8Gi".to_string()),
+fn container_state(info: &super::runtime::ContainerInfo) -> ContainerState {
+    if info.running {
+        ContainerState {
+            running: Some(ContainerStateRunning {
+                started_at: info.started_at,
+            }),
+            ..Default::default()
+        }
+    } else if let Some(exit) = info.exit_code {
+        ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: exit,
+                signal: None,
+                reason: Some(if exit == 0 { "Completed" } else { "Error" }.to_string()),
+                message: None,
+                started_at: info.started_at,
+                finished_at: None,
+                container_id: Some(info.id.clone()),
+            }),
+            ..Default::default()
+        }
+    } else {
+        ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("ContainerCreating".to_string()),
+                message: None,
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+fn failed_container_status(container: &Container, err: &anyhow::Error) -> ContainerStatus {
+    ContainerStatus {
+        name: container.name.clone(),
+        ready: false,
+        restart_count: 0,
+        image: container.image.clone(),
+        image_id: container.image.clone(),
+        container_id: None,
+        state: Some(ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("CreateContainerError".to_string()),
+                message: Some(err.to_string()),
+            }),
+            ..Default::default()
+        }),
+        last_state: None,
+        started: Some(false),
+    }
+}
+
+/// Build the Node object for registration/heartbeat.
+fn build_node_object(name: &str, labels: &HashMap<String, String>) -> Node {
+    let mut capacity = HashMap::from([
+        ("cpu".to_string(), detect_cpu_count().to_string()),
+        ("memory".to_string(), detect_memory_capacity()),
         ("pods".to_string(), "110".to_string()),
     ]);
+    if let Some(disk) = detect_ephemeral_storage() {
+        capacity.insert("ephemeral-storage".to_string(), disk);
+    }
+
+    let internal_ip = detect_internal_ip().unwrap_or_else(|| "127.0.0.1".to_string());
 
     let addresses = vec![
         NodeAddress {
@@ -352,7 +636,7 @@ fn build_node_object(name: &str) -> Node {
         },
         NodeAddress {
             address_type: NodeAddressType::InternalIP,
-            address: "127.0.0.1".to_string(), // Would get real IP in production
+            address: internal_ip,
         },
     ];
 
@@ -366,13 +650,19 @@ fn build_node_object(name: &str) -> Node {
     }];
 
     let node_info = NodeSystemInfo {
-        kernel_version: Some(std::env::consts::OS.to_string()),
-        os_image: Some("Linux".to_string()),
-        container_runtime_version: Some("containerd://1.7.0".to_string()),
-        kubelet_version: Some("kais/0.1.0".to_string()),
+        kernel_version: Some(uname_field("-r").unwrap_or_else(|| "unknown".into())),
+        os_image: Some(detect_os_image()),
+        container_runtime_version: Some(format!("kais://{}", env!("CARGO_PKG_VERSION"))),
+        kubelet_version: Some(format!("kais/{}", env!("CARGO_PKG_VERSION"))),
         operating_system: Some(std::env::consts::OS.to_string()),
         architecture: Some(std::env::consts::ARCH.to_string()),
         ..Default::default()
+    };
+
+    let label_map = if labels.is_empty() {
+        None
+    } else {
+        Some(labels.clone())
     };
 
     Node {
@@ -383,6 +673,7 @@ fn build_node_object(name: &str) -> Node {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             uid: Some(Uuid::new_v4()),
+            labels: label_map,
             ..Default::default()
         },
         spec: Some(NodeSpec::default()),
@@ -395,6 +686,147 @@ fn build_node_object(name: &str) -> Node {
             phase: NodePhase::Running,
             ..Default::default()
         }),
+    }
+}
+
+/// Best-effort total disk capacity for the partition holding `/`. Reported as
+/// a Kubernetes quantity. None if statvfs / df fails.
+fn detect_ephemeral_storage() -> Option<String> {
+    let out = std::process::Command::new("df")
+        .args(["-Pk", "/"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    // df -Pk:
+    //   Filesystem  1024-blocks  Used  Available  Capacity  Mounted on
+    //   /dev/disk1s2  ...
+    let line = s.lines().nth(1)?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(format_quantity(kb * 1024))
+}
+
+/// Run `uname <flag>` and return the stdout, trimmed. None if uname is missing
+/// or fails (e.g. on Windows).
+fn uname_field(flag: &str) -> Option<String> {
+    let out = std::process::Command::new("uname").arg(flag).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Best-effort human-readable OS image string. On Linux this reads
+/// /etc/os-release; on macOS it uses sw_vers; otherwise falls back to OS const.
+fn detect_os_image() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                    return rest.trim_matches('"').to_string();
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(v) = String::from_utf8(out.stdout) {
+                    return format!("macOS {}", v.trim());
+                }
+            }
+        }
+    }
+    std::env::consts::OS.to_string()
+}
+
+/// Pick a non-loopback IPv4 address by opening a UDP socket and asking the OS
+/// what it would route through. No packet is actually sent.
+fn detect_internal_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let addr = sock.local_addr().ok()?;
+    Some(addr.ip().to_string())
+}
+
+/// Number of logical CPUs visible to this process.
+fn detect_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Total physical memory, formatted as a Kubernetes-style quantity ("16Gi",
+/// "8192Mi", etc.). Reads the OS-specific source on each platform; falls back
+/// to "8Gi" if anything goes wrong (so the node still registers cleanly).
+fn detect_memory_capacity() -> String {
+    if let Some(bytes) = read_total_memory_bytes() {
+        return format_quantity(bytes);
+    }
+    "8Gi".to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn read_total_memory_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // Format: "MemTotal:       16322388 kB"
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_total_memory_bytes() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    s.trim().parse().ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_total_memory_bytes() -> Option<u64> {
+    None
+}
+
+/// Render a byte count as a Kubernetes quantity. Picks the largest unit that
+/// gives a clean integer; falls back to bytes if nothing divides evenly.
+fn format_quantity(bytes: u64) -> String {
+    const KI: u64 = 1024;
+    const MI: u64 = 1024 * KI;
+    const GI: u64 = 1024 * MI;
+    const TI: u64 = 1024 * GI;
+
+    if bytes % TI == 0 {
+        format!("{}Ti", bytes / TI)
+    } else if bytes % GI == 0 {
+        format!("{}Gi", bytes / GI)
+    } else if bytes % MI == 0 {
+        format!("{}Mi", bytes / MI)
+    } else if bytes % KI == 0 {
+        format!("{}Ki", bytes / KI)
+    } else {
+        format!("{}", bytes)
     }
 }
 
@@ -539,29 +971,34 @@ async fn handle_logs(
     }
 }
 
-/// Handle streaming logs with -f option
+/// Handle streaming logs with -f option.
+///
+/// kubectl expects `kubectl logs -f` to look like a plain HTTP body that
+/// keeps producing log bytes. We do a chunked text response backed by the
+/// runtime's real follow stream — Docker pumps lines into us as the
+/// container produces them.
 async fn handle_follow_logs(
     state: Arc<RwLock<AgentState>>,
     namespace: String,
     pod: String,
     container: String,
     params: LogQueryParams,
-) -> axum::response::Response {
-    // First get initial logs
-    let (container_id, initial_logs) = {
+) -> Response {
+    // Resolve container_id by (ns, pod, container) — same fallback logic as
+    // the non-follow path.
+    let container_id = {
         let state = state.read().await;
-
-        // Find the container ID - try exact match first
-        let container_id = match state.pod_containers.get(&(namespace.clone(), pod.clone(), container.clone())) {
+        match state
+            .pod_containers
+            .get(&(namespace.clone(), pod.clone(), container.clone()))
+        {
             Some(id) => id.clone(),
             None => {
-                // Try to find by pod name only (match any container in the pod)
                 let matching: Vec<_> = state
                     .pod_containers
                     .iter()
                     .filter(|((ns, p, _), _)| ns == &namespace && p == &pod)
                     .collect();
-
                 if matching.len() == 1 {
                     matching[0].1.clone()
                 } else if matching.is_empty() {
@@ -570,7 +1007,6 @@ async fn handle_follow_logs(
                         .keys()
                         .map(|(ns, p, c)| format!("{}/{}/{}", ns, p, c))
                         .collect();
-
                     return (
                         StatusCode::NOT_FOUND,
                         format!(
@@ -578,7 +1014,11 @@ async fn handle_follow_logs(
                             container,
                             namespace,
                             pod,
-                            if known.is_empty() { "none".to_string() } else { known.join(", ") }
+                            if known.is_empty() {
+                                "none".to_string()
+                            } else {
+                                known.join(", ")
+                            }
                         ),
                     )
                         .into_response();
@@ -587,7 +1027,6 @@ async fn handle_follow_logs(
                         .iter()
                         .map(|((_, _, c), _)| c.clone())
                         .collect();
-
                     return (
                         StatusCode::BAD_REQUEST,
                         format!(
@@ -598,54 +1037,47 @@ async fn handle_follow_logs(
                         .into_response();
                 }
             }
-        };
-
-        let options = LogOptions {
-            tail_lines: params.tail_lines,
-            timestamps: params.timestamps,
-            since_time: params.since_seconds.map(|s| {
-                Utc::now() - chrono::Duration::seconds(s)
-            }),
-            limit_bytes: params.limit_bytes,
-        };
-
-        let logs = state.runtime.get_logs(&container_id, &options).await.unwrap_or_default();
-        (container_id, logs)
+        }
     };
 
-    // Create a stream that sends initial logs and then polls for new ones
-    let stream = async_stream::stream! {
-        // Send initial logs as one event
-        if !initial_logs.is_empty() {
-            yield Ok::<_, Infallible>(Event::default().data(initial_logs));
-        }
+    let options = LogOptions {
+        tail_lines: params.tail_lines,
+        timestamps: params.timestamps,
+        since_time: params
+            .since_seconds
+            .map(|s| Utc::now() - chrono::Duration::seconds(s)),
+        limit_bytes: params.limit_bytes,
+    };
 
-        // Poll for new logs every second
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let timestamps = params.timestamps;
-
-        loop {
-            interval.tick().await;
-
-            let state = state.read().await;
-            let options = LogOptions {
-                tail_lines: Some(10), // Only get recent logs
-                timestamps,
-                since_time: Some(Utc::now() - chrono::Duration::seconds(2)),
-                limit_bytes: None,
-            };
-
-            if let Ok(logs) = state.runtime.get_logs(&container_id, &options).await {
-                if !logs.is_empty() {
-                    yield Ok::<_, Infallible>(Event::default().data(logs));
-                }
+    let stream = {
+        let s = state.read().await;
+        match s.runtime.stream_logs(&container_id, &options).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to start log stream: {}\n", e),
+                )
+                    .into_response();
             }
         }
     };
 
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    // Map anyhow::Result<Bytes> into axum's Body item type.
+    let body_stream = stream.map(|res| res.map_err(std::io::Error::other));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
+        .header(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        )
+        .body(Body::from_stream(body_stream))
+        .unwrap()
 }
 
 // ============================================================================
@@ -811,114 +1243,87 @@ async fn handle_portforward(
     ws.on_upgrade(move |socket| handle_portforward_websocket(socket, pod_ip, ports))
 }
 
-/// Handle the WebSocket connection for port-forward
-async fn handle_portforward_websocket(mut socket: WebSocket, pod_ip: String, ports: Vec<u16>) {
-    tracing::info!(
-        "Port-forward session started for {}:{:?}",
-        pod_ip,
-        ports
-    );
-
-    // Use the first port for simplicity
+/// Handle the WebSocket connection for port-forward.
+///
+/// Bidirectional binary proxy between the kubectl client and `pod_ip:port`.
+/// We split the WebSocket and the TCP stream so both directions can run
+/// concurrently on top of the same socket.
+async fn handle_portforward_websocket(socket: WebSocket, pod_ip: String, ports: Vec<u16>) {
     let port = match ports.first() {
         Some(p) => *p,
         None => {
-            let _ = socket
+            let (mut tx, _rx) = socket.split();
+            let _ = tx
                 .send(Message::Text("No ports specified".to_string()))
                 .await;
             return;
         }
     };
 
-    // Try to connect to the target address
     let target_addr = format!("{}:{}", pod_ip, port);
+    tracing::info!("port-forward → {}", target_addr);
 
-    match TcpStream::connect(&target_addr).await {
-        Ok(tcp_stream) => {
-            let _ = socket
-                .send(Message::Text(format!(
-                    "Connected to {}",
-                    target_addr
-                )))
-                .await;
-
-            // Split the TCP stream
-            let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-
-            // Proxy data between WebSocket and TCP
-            let ws_to_tcp = async {
-                while let Some(msg) = socket.recv().await {
-                    match msg {
-                        Ok(Message::Binary(data)) => {
-                            if tcp_write.write_all(&data).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
-                    }
-                }
-            };
-
-            let tcp_to_ws = async {
-                let mut buf = vec![0u8; 8192];
-                loop {
-                    match tcp_read.read(&mut buf).await {
-                        Ok(0) => break, // Connection closed
-                        Ok(n) => {
-                            // We need to send through a channel or handle differently
-                            // For now, just log
-                            tracing::debug!("Read {} bytes from TCP", n);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            };
-
-            tokio::select! {
-                _ = ws_to_tcp => {},
-                _ = tcp_to_ws => {},
-            }
-        }
+    let tcp_stream = match TcpStream::connect(&target_addr).await {
+        Ok(s) => s,
         Err(e) => {
-            // Connection failed - this is expected in mock mode
-            // Send a mock response instead
-            let _ = socket
+            let (mut tx, _rx) = socket.split();
+            let _ = tx
                 .send(Message::Text(format!(
-                    "Port-forward mock mode: would connect to {} (error: {})\r\n\
-                     In production, this would tunnel TCP traffic to the container.\r\n",
+                    "Failed to connect to {}: {}",
                     target_addr, e
                 )))
                 .await;
+            return;
+        }
+    };
 
-            // Keep the connection open for demonstration
-            while let Some(msg) = socket.recv().await {
-                match msg {
-                    Ok(Message::Binary(data)) => {
-                        // Echo back what we received
-                        let _ = socket
-                            .send(Message::Text(format!(
-                                "Would forward {} bytes to {}\r\n",
-                                data.len(),
-                                target_addr
-                            )))
-                            .await;
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut tcp_rx, mut tcp_tx) = tcp_stream.into_split();
+
+    let ws_to_tcp = async move {
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
                     }
-                    Ok(Message::Text(text)) => {
-                        let _ = socket
-                            .send(Message::Text(format!(
-                                "Would forward: {}\r\n",
-                                text
-                            )))
-                            .await;
-                    }
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    _ => {}
                 }
+                Ok(Message::Text(text)) => {
+                    if tcp_tx.write_all(text.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
             }
         }
+        let _ = tcp_tx.shutdown().await;
+    };
+
+    let tcp_to_ws = async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match tcp_rx.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = ws_tx.close().await;
+    };
+
+    tokio::select! {
+        _ = ws_to_tcp => {},
+        _ = tcp_to_ws => {},
     }
 
-    tracing::info!("Port-forward session ended");
-    let _ = socket.close().await;
+    tracing::info!("port-forward session ended for {}", target_addr);
 }

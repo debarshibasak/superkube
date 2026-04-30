@@ -1,3 +1,4 @@
+mod daemonset;
 mod deployment;
 mod event;
 mod meta;
@@ -5,7 +6,9 @@ mod namespace;
 mod node;
 mod pod;
 mod service;
+mod statefulset;
 
+pub use daemonset::*;
 pub use deployment::*;
 pub use event::*;
 pub use meta::*;
@@ -13,3 +16,4 @@ pub use namespace::*;
 pub use node::*;
 pub use pod::*;
 pub use service::*;
+pub use statefulset::*;

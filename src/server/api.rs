@@ -3,8 +3,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use futures::{SinkExt, StreamExt};
@@ -14,10 +14,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 
-use crate::db::{DeploymentRepository, EndpointsRepository, EventRepository, NamespaceRepository, NodeRepository, PodRepository, ServiceRepository};
+use crate::db::{
+    DaemonSetRepository, DeploymentRepository, EndpointsRepository, EventRepository,
+    NamespaceRepository, NodeRepository, PodRepository, ServiceRepository, StatefulSetRepository,
+};
 use crate::error::Result;
 use crate::models::*;
 
+use super::printers;
+use super::table;
 use super::AppState;
 
 // Query parameters for list operations
@@ -51,6 +56,23 @@ impl ListParams {
 // Discovery Endpoints
 // ============================================================================
 
+/// `kubectl cluster-info` and `kubectl version` hit /version. We pretend to be
+/// a recent-ish Kubernetes minor so client tooling doesn't complain. The build
+/// metadata says "kais" so it's clear what's actually serving.
+pub async fn version_info() -> Json<Value> {
+    Json(json!({
+        "major": "1",
+        "minor": "30",
+        "gitVersion": format!("v1.30.0-kais-{}", env!("CARGO_PKG_VERSION")),
+        "gitCommit": "kais",
+        "gitTreeState": "clean",
+        "buildDate": "1970-01-01T00:00:00Z",
+        "goVersion": "rust",
+        "compiler": "rustc",
+        "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    }))
+}
+
 pub async fn api_versions() -> Json<Value> {
     Json(json!({
         "kind": "APIVersions",
@@ -60,6 +82,7 @@ pub async fn api_versions() -> Json<Value> {
 }
 
 pub async fn api_v1_resources() -> Json<Value> {
+    // `categories: ["all"]` is what `kubectl get all` filters on.
     Json(json!({
         "kind": "APIResourceList",
         "groupVersion": "v1",
@@ -70,6 +93,7 @@ pub async fn api_v1_resources() -> Json<Value> {
                 "namespaced": true,
                 "kind": "Pod",
                 "shortNames": ["po"],
+                "categories": ["all"],
                 "verbs": ["create", "delete", "get", "list", "update", "watch"]
             },
             {
@@ -78,6 +102,7 @@ pub async fn api_v1_resources() -> Json<Value> {
                 "namespaced": true,
                 "kind": "Service",
                 "shortNames": ["svc"],
+                "categories": ["all"],
                 "verbs": ["create", "delete", "get", "list", "update"]
             },
             {
@@ -149,6 +174,25 @@ pub async fn apps_v1_resources() -> Json<Value> {
                 "namespaced": true,
                 "kind": "Deployment",
                 "shortNames": ["deploy"],
+                "categories": ["all"],
+                "verbs": ["create", "delete", "get", "list", "update", "watch"]
+            },
+            {
+                "name": "statefulsets",
+                "singularName": "statefulset",
+                "namespaced": true,
+                "kind": "StatefulSet",
+                "shortNames": ["sts"],
+                "categories": ["all"],
+                "verbs": ["create", "delete", "get", "list", "update", "watch"]
+            },
+            {
+                "name": "daemonsets",
+                "singularName": "daemonset",
+                "namespaced": true,
+                "kind": "DaemonSet",
+                "shortNames": ["ds"],
+                "categories": ["all"],
                 "verbs": ["create", "delete", "get", "list", "update", "watch"]
             }
         ]
@@ -163,27 +207,34 @@ pub async fn list_pods(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
     Query(params): Query<ListParams>,
-) -> Result<Json<List<Pod>>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let label_selector = params.parse_label_selector();
     let pods = PodRepository::list(&state.pool, Some(&namespace), label_selector.as_ref()).await?;
-    Ok(Json(List::new("v1", "PodList", pods)))
+    Ok(table::list_response(
+        &headers, "v1", "PodList", pods, printers::POD_COLUMNS, printers::pod_row,
+    ))
 }
 
 pub async fn list_all_pods(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
-) -> Result<Json<List<Pod>>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let label_selector = params.parse_label_selector();
     let pods = PodRepository::list(&state.pool, None, label_selector.as_ref()).await?;
-    Ok(Json(List::new("v1", "PodList", pods)))
+    Ok(table::list_response(
+        &headers, "v1", "PodList", pods, printers::POD_COLUMNS, printers::pod_row,
+    ))
 }
 
 pub async fn get_pod(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Pod>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let pod = PodRepository::get(&state.pool, &namespace, &name).await?;
-    Ok(Json(pod))
+    Ok(table::item_response(&headers, pod, printers::POD_COLUMNS, printers::pod_row))
 }
 
 pub async fn create_pod(
@@ -274,7 +325,7 @@ pub async fn get_pod_logs(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<LogParams>,
-) -> Result<String> {
+) -> Result<Response> {
     // Get the pod to verify it exists and find the node
     let pod = PodRepository::get(&state.pool, &namespace, &name).await?;
 
@@ -305,25 +356,23 @@ pub async fn get_pod_logs(
     let node_name = match &pod.spec.node_name {
         Some(node) => node.clone(),
         None => {
-            return Ok(format!(
+            return Ok(plain_text(format!(
                 "Pod {} is not yet scheduled to a node\n",
                 name
-            ));
+            )));
         }
     };
 
-    // Get the node to find its address
     let node = match crate::db::NodeRepository::get(&state.pool, &node_name).await {
         Ok(n) => n,
         Err(_) => {
-            return Ok(format!(
+            return Ok(plain_text(format!(
                 "Node {} not found, cannot retrieve logs\n",
                 node_name
-            ));
+            )));
         }
     };
 
-    // Find the node's internal IP address
     let node_address = node
         .status
         .as_ref()
@@ -338,21 +387,18 @@ pub async fn get_pod_logs(
     let node_addr = match node_address {
         Some(addr) => addr,
         None => {
-            return Ok(format!(
+            return Ok(plain_text(format!(
                 "Node {} has no internal IP address, cannot retrieve logs\n",
                 node_name
-            ));
+            )));
         }
     };
 
-    // Build the URL to the node agent's log endpoint
-    // Node agents listen on port 10250 by default
     let log_url = format!(
         "http://{}:10250/logs/{}/{}/{}",
         node_addr, namespace, name, container_name
     );
 
-    // Add query parameters
     let client = reqwest::Client::new();
     let mut request = client.get(&log_url);
 
@@ -371,31 +417,65 @@ pub async fn get_pod_logs(
     if let Some(limit) = params.limit_bytes {
         request = request.query(&[("limitBytes", limit.to_string())]);
     }
+    if params.follow {
+        request = request.query(&[("follow", "true")]);
+    }
 
-    // Make the request to the node agent
-    match request.send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.text().await {
-                    Ok(logs) => Ok(logs),
-                    Err(e) => Ok(format!("Failed to read logs from node: {}\n", e)),
-                }
-            } else {
-                Ok(format!(
-                    "Failed to get logs from node {}: HTTP {}\n",
-                    node_name,
-                    response.status()
-                ))
-            }
-        }
+    let response = match request.send().await {
+        Ok(r) => r,
         Err(e) => {
-            // Node agent might not be reachable, return a helpful message
-            Ok(format!(
+            return Ok(plain_text(format!(
                 "Cannot connect to node agent on {}: {}\nMake sure the node agent is running.\n",
                 node_name, e
-            ))
+            )));
         }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        return Ok(plain_text(format!(
+            "Failed to get logs from node {}: HTTP {}\n",
+            node_name, status
+        )));
     }
+
+    if params.follow {
+        // Streaming proxy: pipe the agent's response body straight to the
+        // kubectl client. Calling `.text()` here would wait for EOF, which
+        // never comes when the container is still running.
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        let body = axum::body::Body::from_stream(stream);
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
+            .body(body)
+            .unwrap());
+    }
+
+    match response.text().await {
+        Ok(logs) => Ok(plain_text(logs)),
+        Err(e) => Ok(plain_text(format!(
+            "Failed to read logs from node: {}\n",
+            e
+        ))),
+    }
+}
+
+fn plain_text(s: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .body(axum::body::Body::from(s))
+        .unwrap()
 }
 
 /// Query parameters for exec requests
@@ -775,22 +855,33 @@ async fn handle_portforward_websocket(mut client_socket: WebSocket, node_url: St
 pub async fn list_services(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
-) -> Result<Json<List<Service>>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let services = ServiceRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(Json(List::new("v1", "ServiceList", services)))
+    Ok(table::list_response(
+        &headers, "v1", "ServiceList", services, printers::SERVICE_COLUMNS, printers::service_row,
+    ))
 }
 
-pub async fn list_all_services(State(state): State<Arc<AppState>>) -> Result<Json<List<Service>>> {
+pub async fn list_all_services(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
     let services = ServiceRepository::list(&state.pool, None).await?;
-    Ok(Json(List::new("v1", "ServiceList", services)))
+    Ok(table::list_response(
+        &headers, "v1", "ServiceList", services, printers::SERVICE_COLUMNS, printers::service_row,
+    ))
 }
 
 pub async fn get_service(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Service>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let service = ServiceRepository::get(&state.pool, &namespace, &name).await?;
-    Ok(Json(service))
+    Ok(table::item_response(
+        &headers, service, printers::SERVICE_COLUMNS, printers::service_row,
+    ))
 }
 
 pub async fn create_service(
@@ -843,17 +934,25 @@ pub async fn delete_service(
 // Node Handlers
 // ============================================================================
 
-pub async fn list_nodes(State(state): State<Arc<AppState>>) -> Result<Json<List<Node>>> {
+pub async fn list_nodes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
     let nodes = NodeRepository::list(&state.pool).await?;
-    Ok(Json(List::new("v1", "NodeList", nodes)))
+    Ok(table::list_response(
+        &headers, "v1", "NodeList", nodes, printers::NODE_COLUMNS, printers::node_row,
+    ))
 }
 
 pub async fn get_node(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<Node>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let node = NodeRepository::get(&state.pool, &name).await?;
-    Ok(Json(node))
+    Ok(table::item_response(
+        &headers, node, printers::NODE_COLUMNS, printers::node_row,
+    ))
 }
 
 pub async fn create_node(
@@ -918,24 +1017,46 @@ pub async fn get_endpoints(
 pub async fn list_deployments(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
-) -> Result<Json<List<Deployment>>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let deployments = DeploymentRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(Json(List::new("apps/v1", "DeploymentList", deployments)))
+    Ok(table::list_response(
+        &headers,
+        "apps/v1",
+        "DeploymentList",
+        deployments,
+        printers::DEPLOYMENT_COLUMNS,
+        printers::deployment_row,
+    ))
 }
 
 pub async fn list_all_deployments(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<List<Deployment>>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let deployments = DeploymentRepository::list(&state.pool, None).await?;
-    Ok(Json(List::new("apps/v1", "DeploymentList", deployments)))
+    Ok(table::list_response(
+        &headers,
+        "apps/v1",
+        "DeploymentList",
+        deployments,
+        printers::DEPLOYMENT_COLUMNS,
+        printers::deployment_row,
+    ))
 }
 
 pub async fn get_deployment(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Deployment>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let deployment = DeploymentRepository::get(&state.pool, &namespace, &name).await?;
-    Ok(Json(deployment))
+    Ok(table::item_response(
+        &headers,
+        deployment,
+        printers::DEPLOYMENT_COLUMNS,
+        printers::deployment_row,
+    ))
 }
 
 pub async fn create_deployment(
@@ -996,17 +1117,31 @@ pub async fn delete_deployment(
 
 pub async fn list_namespaces(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<List<Namespace>>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let namespaces = NamespaceRepository::list(&state.pool).await?;
-    Ok(Json(List::new("v1", "NamespaceList", namespaces)))
+    Ok(table::list_response(
+        &headers,
+        "v1",
+        "NamespaceList",
+        namespaces,
+        printers::NAMESPACE_COLUMNS,
+        printers::namespace_row,
+    ))
 }
 
 pub async fn get_namespace(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<Namespace>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let namespace = NamespaceRepository::get(&state.pool, &name).await?;
-    Ok(Json(namespace))
+    Ok(table::item_response(
+        &headers,
+        namespace,
+        printers::NAMESPACE_COLUMNS,
+        printers::namespace_row,
+    ))
 }
 
 pub async fn create_namespace(
@@ -1081,7 +1216,8 @@ pub async fn list_events(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
     Query(params): Query<EventListParams>,
-) -> Result<Json<EventList>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let (obj_name, obj_kind) = params.parse_involved_object();
     let events = EventRepository::list(
         &state.pool,
@@ -1090,13 +1226,21 @@ pub async fn list_events(
         obj_kind.as_deref(),
     )
     .await?;
-    Ok(Json(EventList::new(events)))
+    Ok(table::list_response(
+        &headers,
+        "v1",
+        "EventList",
+        events,
+        printers::EVENT_COLUMNS,
+        printers::event_row,
+    ))
 }
 
 pub async fn list_all_events(
     State(state): State<Arc<AppState>>,
     Query(params): Query<EventListParams>,
-) -> Result<Json<EventList>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let (obj_name, obj_kind) = params.parse_involved_object();
     let events = EventRepository::list(
         &state.pool,
@@ -1105,15 +1249,28 @@ pub async fn list_all_events(
         obj_kind.as_deref(),
     )
     .await?;
-    Ok(Json(EventList::new(events)))
+    Ok(table::list_response(
+        &headers,
+        "v1",
+        "EventList",
+        events,
+        printers::EVENT_COLUMNS,
+        printers::event_row,
+    ))
 }
 
 pub async fn get_event(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Event>> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let event = EventRepository::get(&state.pool, &namespace, &name).await?;
-    Ok(Json(event))
+    Ok(table::item_response(
+        &headers,
+        event,
+        printers::EVENT_COLUMNS,
+        printers::event_row,
+    ))
 }
 
 pub async fn create_event(
@@ -1142,5 +1299,192 @@ pub async fn delete_event(
             "name": name,
             "kind": "events"
         }
+    })))
+}
+
+// ============================================================================
+// StatefulSet Handlers
+// ============================================================================
+
+pub async fn list_statefulsets(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = StatefulSetRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(
+        &headers,
+        "apps/v1",
+        "StatefulSetList",
+        items,
+        printers::STATEFULSET_COLUMNS,
+        printers::statefulset_row,
+    ))
+}
+
+pub async fn list_all_statefulsets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = StatefulSetRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(
+        &headers,
+        "apps/v1",
+        "StatefulSetList",
+        items,
+        printers::STATEFULSET_COLUMNS,
+        printers::statefulset_row,
+    ))
+}
+
+pub async fn get_statefulset(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = StatefulSetRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(
+        &headers,
+        item,
+        printers::STATEFULSET_COLUMNS,
+        printers::statefulset_row,
+    ))
+}
+
+pub async fn create_statefulset(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut ss): Json<StatefulSet>,
+) -> Result<(StatusCode, Json<StatefulSet>)> {
+    if ss.metadata.namespace.is_none() {
+        ss.metadata.namespace = Some(namespace);
+    }
+    let created = StatefulSetRepository::create(&state.pool, &ss).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+pub async fn update_statefulset(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut ss): Json<StatefulSet>,
+) -> Result<Json<StatefulSet>> {
+    ss.metadata.namespace = Some(namespace);
+    ss.metadata.name = Some(name);
+    Ok(Json(StatefulSetRepository::create(&state.pool, &ss).await?))
+}
+
+pub async fn delete_statefulset(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    // Best-effort: also delete the owned pods.
+    if let Ok(ss) = StatefulSetRepository::get(&state.pool, &namespace, &name).await {
+        if let Some(selector) = &ss.spec.selector.match_labels {
+            if let Ok(pods) = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await {
+                for pod in pods {
+                    if let Some(pod_name) = pod.metadata.name {
+                        let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
+                    }
+                }
+            }
+        }
+    }
+    StatefulSetRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({
+        "apiVersion": "v1", "kind": "Status", "metadata": {}, "status": "Success",
+        "details": {"name": name, "group": "apps", "kind": "statefulsets"}
+    })))
+}
+
+// ============================================================================
+// DaemonSet Handlers
+// ============================================================================
+
+pub async fn list_daemonsets(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = DaemonSetRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(
+        &headers,
+        "apps/v1",
+        "DaemonSetList",
+        items,
+        printers::DAEMONSET_COLUMNS,
+        printers::daemonset_row,
+    ))
+}
+
+pub async fn list_all_daemonsets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = DaemonSetRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(
+        &headers,
+        "apps/v1",
+        "DaemonSetList",
+        items,
+        printers::DAEMONSET_COLUMNS,
+        printers::daemonset_row,
+    ))
+}
+
+pub async fn get_daemonset(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = DaemonSetRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(
+        &headers,
+        item,
+        printers::DAEMONSET_COLUMNS,
+        printers::daemonset_row,
+    ))
+}
+
+pub async fn create_daemonset(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut ds): Json<DaemonSet>,
+) -> Result<(StatusCode, Json<DaemonSet>)> {
+    if ds.metadata.namespace.is_none() {
+        ds.metadata.namespace = Some(namespace);
+    }
+    let created = DaemonSetRepository::create(&state.pool, &ds).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+pub async fn update_daemonset(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut ds): Json<DaemonSet>,
+) -> Result<Json<DaemonSet>> {
+    ds.metadata.namespace = Some(namespace);
+    ds.metadata.name = Some(name);
+    Ok(Json(DaemonSetRepository::create(&state.pool, &ds).await?))
+}
+
+pub async fn delete_daemonset(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    if let Ok(ds) = DaemonSetRepository::get(&state.pool, &namespace, &name).await {
+        if let Some(selector) = &ds.spec.selector.match_labels {
+            if let Ok(pods) = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await {
+                for pod in pods {
+                    if let Some(pod_name) = pod.metadata.name {
+                        let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
+                    }
+                }
+            }
+        }
+    }
+    DaemonSetRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({
+        "apiVersion": "v1", "kind": "Status", "metadata": {}, "status": "Success",
+        "details": {"name": name, "group": "apps", "kind": "daemonsets"}
     })))
 }

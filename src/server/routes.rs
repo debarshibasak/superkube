@@ -9,7 +9,11 @@ use super::AppState;
 
 pub fn api_routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Discovery endpoints
+        // Discovery & cluster-info
+        .route("/version", get(api::version_info))
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/livez", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ok" }))
         .route("/api", get(api::api_versions))
         .route("/api/v1", get(api::api_v1_resources))
         .route("/apis", get(api::api_groups))
@@ -79,6 +83,30 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .delete(api::delete_deployment),
         )
         .route("/apis/apps/v1/deployments", get(api::list_all_deployments))
+        // StatefulSets (apps/v1)
+        .route(
+            "/apis/apps/v1/namespaces/:namespace/statefulsets",
+            get(api::list_statefulsets).post(api::create_statefulset),
+        )
+        .route(
+            "/apis/apps/v1/namespaces/:namespace/statefulsets/:name",
+            get(api::get_statefulset)
+                .put(api::update_statefulset)
+                .delete(api::delete_statefulset),
+        )
+        .route("/apis/apps/v1/statefulsets", get(api::list_all_statefulsets))
+        // DaemonSets (apps/v1)
+        .route(
+            "/apis/apps/v1/namespaces/:namespace/daemonsets",
+            get(api::list_daemonsets).post(api::create_daemonset),
+        )
+        .route(
+            "/apis/apps/v1/namespaces/:namespace/daemonsets/:name",
+            get(api::get_daemonset)
+                .put(api::update_daemonset)
+                .delete(api::delete_daemonset),
+        )
+        .route("/apis/apps/v1/daemonsets", get(api::list_all_daemonsets))
         // Namespaces
         .route(
             "/api/v1/namespaces",

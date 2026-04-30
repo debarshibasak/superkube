@@ -6,6 +6,7 @@ mod error;
 mod models;
 mod node;
 mod server;
+mod util;
 
 pub use error::{Error, Result};
 
@@ -21,8 +22,9 @@ struct Cli {
 enum Commands {
     /// Start the control plane server (runs migrations automatically)
     Server {
-        /// PostgreSQL database URL
-        #[arg(long, env = "DATABASE_URL")]
+        /// Database URL (postgres://... or sqlite://path/to/file.db).
+        /// Defaults to a local SQLite file (`sqlite://./kais.db`) if not set.
+        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://./kais.db")]
         db_url: String,
 
         /// Port to listen on
@@ -36,9 +38,9 @@ enum Commands {
 
     /// Start a node agent
     Node {
-        /// Name of this node
+        /// Name of this node. Defaults to the host's hostname.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
 
         /// URL of the kais server
         #[arg(long)]
@@ -73,8 +75,9 @@ async fn main() -> anyhow::Result<()> {
             server: server_url,
             containerd_socket,
         } => {
+            let name = name.unwrap_or_else(util::detect_hostname);
             tracing::info!("Starting kais node agent: {}", name);
-            node::run(&name, &server_url, &containerd_socket).await?;
+            node::run(&name, &server_url, &containerd_socket, std::collections::HashMap::new()).await?;
         }
     }
 

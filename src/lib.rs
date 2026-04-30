@@ -3,5 +3,6 @@ pub mod error;
 pub mod models;
 pub mod node;
 pub mod server;
+pub mod util;
 
 pub use error::{Error, Result};

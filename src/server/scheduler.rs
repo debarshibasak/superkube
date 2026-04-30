@@ -1,16 +1,18 @@
-use sqlx::PgPool;
+use sqlx::AnyPool;
 use tokio::time::{interval, Duration};
 
 use crate::db::{NodeRepository, PodRepository};
 use crate::models::*;
 
+use super::controller;
+
 /// Scheduler assigns pending pods to nodes
 pub struct Scheduler {
-    pool: PgPool,
+    pool: AnyPool,
 }
 
 impl Scheduler {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: AnyPool) -> Self {
         Self { pool }
     }
 
@@ -75,8 +77,26 @@ impl Scheduler {
             node_name
         );
 
-        // Bind pod to node
         PodRepository::bind_to_node(&self.pool, namespace, pod_name, node_name).await?;
+
+        controller::emit_event(
+            &self.pool,
+            &ObjectReference {
+                api_version: Some("v1".to_string()),
+                kind: Some("Pod".to_string()),
+                name: pod.metadata.name.clone(),
+                namespace: pod.metadata.namespace.clone(),
+                uid: pod.metadata.uid,
+                resource_version: None,
+                field_path: None,
+            },
+            namespace,
+            EventType::Normal,
+            "Scheduled",
+            &format!("Successfully assigned {}/{} to {}", namespace, pod_name, node_name),
+            "scheduler",
+        )
+        .await;
 
         Ok(())
     }

@@ -1,0 +1,130 @@
+//! Container runtime abstraction.
+//!
+//! Multiple backends sit behind one trait:
+//!   - `mock`   : in-memory stub, works everywhere — useful for dev and tests
+//!   - `docker` : talks to Docker Desktop / dockerd via /var/run/docker.sock
+//!                (compiled on macOS; this is how we actually run containers
+//!                on a Mac, since macOS has no Linux kernel features)
+//!   - (future) `embedded`: libcontainer + image pull, Linux-only single binary
+//!
+//! `default()` picks the right backend for the host: Docker on macOS,
+//! mock everywhere else (until the libcontainer wrapper lands).
+
+use std::pin::Pin;
+
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures::Stream;
+
+use crate::models::Container;
+
+mod mock;
+#[cfg(target_os = "macos")]
+mod docker;
+
+/// Stream of raw log bytes from a container. Each item is one chunk; we don't
+/// guarantee chunks align to lines.
+pub type LogStream = Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send>>;
+
+/// Options for fetching container logs.
+#[derive(Default, Debug, Clone)]
+pub struct LogOptions {
+    pub tail_lines: Option<i64>,
+    pub timestamps: bool,
+    pub since_time: Option<DateTime<Utc>>,
+    pub limit_bytes: Option<i64>,
+}
+
+/// One published port: container's internal port → host port.
+#[derive(Debug, Clone)]
+pub struct PortMapping {
+    pub container_port: i32,
+    pub host_port: u16,
+    /// "tcp" or "udp" (lowercase).
+    pub protocol: String,
+}
+
+/// Snapshot of a container's state, as observed by the runtime. Returned by
+/// `find_container` so the agent can build `containerStatuses` and decide
+/// whether the container needs to be (re)started.
+#[derive(Debug, Clone)]
+pub struct ContainerInfo {
+    pub id: String,
+    pub running: bool,
+    pub restart_count: i32,
+    pub started_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    /// Ports the runtime has published to the host. Empty if the runtime
+    /// doesn't do port publishing (e.g. the in-memory mock).
+    pub port_mappings: Vec<PortMapping>,
+}
+
+/// What every container backend must do.
+///
+/// Methods are async; mutating ops take `&mut self` so the in-memory mock can
+/// keep using a `HashMap`. `Send + Sync` so the agent can hold one inside
+/// `Arc<RwLock<_>>`.
+#[async_trait::async_trait]
+pub trait Runtime: Send + Sync {
+    /// Create + start a container. `name` is the (already namespaced) container
+    /// name; `container` carries the image, command/args, env, working_dir, etc.
+    /// Returns an opaque runtime-specific ID (`docker://...`, `containerd://...`).
+    async fn create_and_start_container(
+        &mut self,
+        name: &str,
+        container: &Container,
+    ) -> anyhow::Result<String>;
+
+    async fn is_container_running(&self, container_id: &str) -> anyhow::Result<bool>;
+
+    /// Look up a container by the *name* the agent gave it
+    /// (typically `<pod-name>-<container-name>`). Returns `None` if no such
+    /// container exists. This is the heart of reconciliation: every tick the
+    /// agent re-observes runtime state by name rather than trusting an
+    /// in-memory map that resets across restarts.
+    async fn find_container(&self, name: &str) -> anyhow::Result<Option<ContainerInfo>>;
+
+    async fn get_logs(&self, container_id: &str, options: &LogOptions) -> anyhow::Result<String>;
+
+    /// Stream container logs as they're produced. Used by `kubectl logs -f`.
+    /// Default implementation just dumps the current log contents and ends —
+    /// runtimes that support real streaming (Docker) override this.
+    async fn stream_logs(
+        &self,
+        container_id: &str,
+        options: &LogOptions,
+    ) -> anyhow::Result<LogStream> {
+        let logs = self.get_logs(container_id, options).await?;
+        let bytes = Bytes::from(logs.into_bytes());
+        Ok(Box::pin(futures::stream::iter([Ok(bytes)])))
+    }
+
+    /// Best-effort name describing this backend (logged at startup).
+    fn name(&self) -> &'static str;
+}
+
+/// Pick the right runtime for the host. macOS → Docker; otherwise mock.
+///
+/// Docker errors (daemon unreachable, etc.) on macOS fall back to the mock so
+/// the agent at least registers and is observable while you fix Docker.
+pub async fn default(socket_path: &str) -> anyhow::Result<Box<dyn Runtime>> {
+    #[cfg(target_os = "macos")]
+    {
+        match docker::DockerRuntime::new().await {
+            Ok(r) => {
+                tracing::info!("using Docker runtime");
+                return Ok(Box::new(r));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Docker runtime unavailable ({}); falling back to mock runtime",
+                    e
+                );
+            }
+        }
+    }
+
+    let mock = mock::ContainerdRuntime::new(socket_path).await?;
+    tracing::info!("using mock runtime");
+    Ok(Box::new(mock))
+}
