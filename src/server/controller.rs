@@ -732,7 +732,7 @@ pub(super) async fn emit_event(
         count: Some(1),
         event_type: Some(typ),
         action: None,
-        reporting_controller: Some(format!("kais/{component}")),
+        reporting_controller: Some(format!("superkube/{component}")),
         reporting_instance: None,
     };
 

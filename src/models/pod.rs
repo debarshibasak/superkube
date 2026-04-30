@@ -59,6 +59,12 @@ pub struct PodSpec {
     /// Host networking mode
     #[serde(default)]
     pub host_network: bool,
+
+    /// Scheduling preferences (node + pod affinity/anti-affinity).
+    /// `requiredDuringSchedulingIgnoredDuringExecution` terms are honoured
+    /// during pod placement; preferred terms are stored but not yet weighted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<super::Affinity>,
 }
 
 /// Container describes a single container in a pod

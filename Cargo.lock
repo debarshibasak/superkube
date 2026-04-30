@@ -1555,44 +1555,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kais"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum 0.7.9",
- "bollard",
- "bytes",
- "chrono",
- "clap",
- "containerd-client",
- "flate2",
- "futures",
- "hex",
- "libcontainer",
- "oci-distribution",
- "oci-spec 0.7.1",
- "prost",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tar",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tokio-tungstenite",
- "tonic",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3288,6 +3250,45 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "superkube"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum 0.7.9",
+ "bollard",
+ "bytes",
+ "chrono",
+ "clap",
+ "containerd-client",
+ "flate2",
+ "futures",
+ "hex",
+ "libcontainer",
+ "oci-distribution",
+ "oci-spec 0.7.1",
+ "prost",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "sqlx",
+ "tar",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite",
+ "tonic",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "syn"

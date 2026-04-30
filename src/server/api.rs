@@ -15,8 +15,10 @@ use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 
 use crate::db::{
+    ClusterRoleBindingRepository, ClusterRoleRepository, ConfigMapRepository,
     DaemonSetRepository, DeploymentRepository, EndpointsRepository, EventRepository,
-    NamespaceRepository, NodeRepository, PodRepository, ServiceRepository, StatefulSetRepository,
+    NamespaceRepository, NodeRepository, PodRepository, SecretRepository, ServiceAccountRepository,
+    ServiceRepository, StatefulSetRepository,
 };
 use crate::error::Result;
 use crate::models::*;
@@ -24,6 +26,18 @@ use crate::models::*;
 use super::printers;
 use super::table;
 use super::AppState;
+
+/// Pull the first three octets out of a service CIDR (e.g. "10.96.0.0/12" →
+/// "10.96.0"). ClusterIPs are then assembled as `<prefix>.<last_octet>`.
+fn service_cidr_prefix(cidr: &str) -> String {
+    let addr_part = cidr.split('/').next().unwrap_or(cidr);
+    let octets: Vec<&str> = addr_part.split('.').collect();
+    if octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+        format!("{}.{}.{}", octets[0], octets[1], octets[2])
+    } else {
+        "10.96.0".to_string()
+    }
+}
 
 // Query parameters for list operations
 #[derive(Debug, Deserialize, Default)]
@@ -58,13 +72,13 @@ impl ListParams {
 
 /// `kubectl cluster-info` and `kubectl version` hit /version. We pretend to be
 /// a recent-ish Kubernetes minor so client tooling doesn't complain. The build
-/// metadata says "kais" so it's clear what's actually serving.
+/// metadata says "superkube" so it's clear what's actually serving.
 pub async fn version_info() -> Json<Value> {
     Json(json!({
         "major": "1",
         "minor": "30",
-        "gitVersion": format!("v1.30.0-kais-{}", env!("CARGO_PKG_VERSION")),
-        "gitCommit": "kais",
+        "gitVersion": format!("v1.30.0-superkube-{}", env!("CARGO_PKG_VERSION")),
+        "gitCommit": "superkube",
         "gitTreeState": "clean",
         "buildDate": "1970-01-01T00:00:00Z",
         "goVersion": "rust",
@@ -79,6 +93,51 @@ pub async fn api_versions() -> Json<Value> {
         "versions": ["v1"],
         "serverAddressByClientCIDRs": []
     }))
+}
+
+/// /openapi/v2 — kubectl ≥1.27 asks for `Accept: application/com.github.proto-openapi.spec.v2@v1.0+protobuf`
+/// (no JSON fallback) and ignores the response Content-Type when parsing.
+/// Whatever bytes we return, kubectl runs `proto.Unmarshal` over them.
+///
+/// An empty body is a valid `gnostic.openapi.v2.Document` (no fields set →
+/// all defaults), so `proto.Unmarshal([]byte{}, &Document{})` succeeds and
+/// kubectl moves on with "no schemas published" → no client-side validation.
+///
+/// We also send `Content-Type: application/json` so any client *not* doing
+/// the protobuf hot-path treats it as a missing/invalid swagger doc rather
+/// than rejecting our content-type header.
+pub async fn openapi_v2(_headers: HeaderMap) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::CONTENT_LENGTH, "0")
+        .body(axum::body::Body::from(Vec::<u8>::new()))
+        .unwrap()
+}
+
+/// /openapi/v3: kubectl asks with `Accept: application/json, */*` so plain
+/// JSON is fine. Empty paths == "no schemas".
+pub async fn openapi_v3(_headers: HeaderMap) -> Response {
+    Json(json!({ "paths": {} })).into_response()
+}
+
+fn pick_proto_v2(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::ACCEPT)?.to_str().ok()?;
+    raw.split(',')
+        .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
+        .find(|s| s.contains("proto-openapi"))
+}
+
+fn empty_proto_response(content_type: &str) -> Response {
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .body(axum::body::Body::from(Vec::<u8>::new()))
+        .unwrap();
+    if let Ok(value) = axum::http::HeaderValue::from_str(content_type) {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    resp
 }
 
 pub async fn api_v1_resources() -> Json<Value> {
@@ -136,6 +195,38 @@ pub async fn api_v1_resources() -> Json<Value> {
                 "kind": "Event",
                 "shortNames": ["ev"],
                 "verbs": ["create", "delete", "get", "list"]
+            },
+            {
+                "name": "serviceaccounts",
+                "singularName": "serviceaccount",
+                "namespaced": true,
+                "kind": "ServiceAccount",
+                "shortNames": ["sa"],
+                "verbs": ["create", "delete", "get", "list", "update"]
+            },
+            {
+                "name": "secrets",
+                "singularName": "secret",
+                "namespaced": true,
+                "kind": "Secret",
+                "verbs": ["create", "delete", "get", "list", "update"]
+            },
+            {
+                "name": "configmaps",
+                "singularName": "configmap",
+                "namespaced": true,
+                "kind": "ConfigMap",
+                "shortNames": ["cm"],
+                "verbs": ["create", "delete", "get", "list", "update"]
+            },
+            {
+                "name": "replicationcontrollers",
+                "singularName": "replicationcontroller",
+                "namespaced": true,
+                "kind": "ReplicationController",
+                "shortNames": ["rc"],
+                "categories": ["all"],
+                "verbs": ["get", "list"]
             }
         ]
     }))
@@ -148,16 +239,13 @@ pub async fn api_groups() -> Json<Value> {
         "groups": [
             {
                 "name": "apps",
-                "versions": [
-                    {
-                        "groupVersion": "apps/v1",
-                        "version": "v1"
-                    }
-                ],
-                "preferredVersion": {
-                    "groupVersion": "apps/v1",
-                    "version": "v1"
-                }
+                "versions": [{"groupVersion":"apps/v1","version":"v1"}],
+                "preferredVersion": {"groupVersion":"apps/v1","version":"v1"}
+            },
+            {
+                "name": "rbac.authorization.k8s.io",
+                "versions": [{"groupVersion":"rbac.authorization.k8s.io/v1","version":"v1"}],
+                "preferredVersion": {"groupVersion":"rbac.authorization.k8s.io/v1","version":"v1"}
             }
         ]
     }))
@@ -194,6 +282,15 @@ pub async fn apps_v1_resources() -> Json<Value> {
                 "shortNames": ["ds"],
                 "categories": ["all"],
                 "verbs": ["create", "delete", "get", "list", "update", "watch"]
+            },
+            {
+                "name": "replicasets",
+                "singularName": "replicaset",
+                "namespaced": true,
+                "kind": "ReplicaSet",
+                "shortNames": ["rs"],
+                "categories": ["all"],
+                "verbs": ["get", "list"]
             }
         ]
     }))
@@ -432,11 +529,20 @@ pub async fn get_pod_logs(
     };
 
     if !response.status().is_success() {
+        // Pass the agent's status code through. kubectl renders a 404 as
+        // "no logs available" cleanly, instead of a 200 body that says
+        // "Failed to get logs from node X: HTTP 404" — which is what
+        // ended up inside `kubectl cluster-info dump` files.
         let status = response.status();
-        return Ok(plain_text(format!(
-            "Failed to get logs from node {}: HTTP {}\n",
-            node_name, status
-        )));
+        let body = response.text().await.unwrap_or_default();
+        return Ok(Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap());
     }
 
     if params.follow {
@@ -478,39 +584,54 @@ fn plain_text(s: String) -> Response {
         .unwrap()
 }
 
-/// Query parameters for exec requests
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+/// Decoded exec query params. kubectl sends each argv entry as its own
+/// `command=` parameter, so `command` is a Vec.
+#[derive(Debug, Default)]
 pub struct ExecParams {
-    /// Container name (required if pod has multiple containers)
     pub container: Option<String>,
-    /// Command to execute
-    pub command: Option<String>,
-    /// Stdin if true, stdin is opened
-    #[serde(default)]
+    pub command: Vec<String>,
     pub stdin: bool,
-    /// Stdout if true, stdout is returned
-    #[serde(default = "default_true")]
     pub stdout: bool,
-    /// Stderr if true, stderr is returned
-    #[serde(default = "default_true")]
     pub stderr: bool,
-    /// TTY if true, allocate a pseudo-TTY
-    #[serde(default)]
     pub tty: bool,
 }
 
-fn default_true() -> bool {
-    true
+impl ExecParams {
+    fn from_query(q: &str) -> Self {
+        let pairs: Vec<(String, String)> =
+            serde_urlencoded::from_str(q).unwrap_or_default();
+        let mut p = ExecParams {
+            stdout: true,
+            stderr: true,
+            ..Default::default()
+        };
+        for (k, v) in pairs {
+            match k.as_str() {
+                "container" => p.container = Some(v),
+                "command" => p.command.push(v),
+                "stdin" => p.stdin = v == "true" || v == "1",
+                "stdout" => p.stdout = v == "true" || v == "1",
+                "stderr" => p.stderr = v == "true" || v == "1",
+                "tty" => p.tty = v == "true" || v == "1",
+                _ => {}
+            }
+        }
+        p
+    }
 }
 
-/// Handle exec requests via WebSocket
+/// Handle exec requests via WebSocket. We take the raw query string rather
+/// than `Query<ExecParams>` because kubectl sends repeated `command=` query
+/// params (one per argv entry), and serde_urlencoded into the typed struct
+/// only keeps the last one — which then makes `kubectl exec POD -- echo hello`
+/// look identical to `kubectl exec POD -- hello`.
 pub async fn exec_pod(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
-    Query(params): Query<ExecParams>,
+    raw_query: axum::extract::RawQuery,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let params = ExecParams::from_query(raw_query.0.as_deref().unwrap_or(""));
     // Get the pod to verify it exists and find the node
     let pod = match PodRepository::get(&state.pool, &namespace, &name).await {
         Ok(p) => p,
@@ -594,33 +715,80 @@ pub async fn exec_pod(
         }
     };
 
-    // Build the WebSocket URL to the node agent's exec endpoint
+    // Build the upstream URL. Each command word becomes its own `command=`
+    // query param so the agent's parser sees them all.
+    let mut query_pairs: Vec<(String, String)> = Vec::new();
+    if params.command.is_empty() {
+        query_pairs.push(("command".to_string(), "sh".to_string()));
+    } else {
+        for word in &params.command {
+            query_pairs.push(("command".to_string(), word.clone()));
+        }
+    }
+    query_pairs.push(("stdin".to_string(), params.stdin.to_string()));
+    query_pairs.push(("stdout".to_string(), params.stdout.to_string()));
+    query_pairs.push(("stderr".to_string(), params.stderr.to_string()));
+    query_pairs.push(("tty".to_string(), params.tty.to_string()));
+    let query_string = serde_urlencoded::to_string(&query_pairs).unwrap_or_default();
+
     let exec_url = format!(
-        "ws://{}:10250/exec/{}/{}/{}?command={}&stdin={}&stdout={}&stderr={}&tty={}",
-        node_addr,
-        namespace,
-        name,
-        container_name,
-        params.command.as_deref().unwrap_or("sh"),
-        params.stdin,
-        params.stdout,
-        params.stderr,
-        params.tty
+        "ws://{}:10250/exec/{}/{}/{}?{}",
+        node_addr, namespace, name, container_name, query_string
     );
 
-    ws.on_upgrade(move |socket| handle_exec_websocket(socket, exec_url))
+    // Negotiate the same WebSocket sub-protocols kubectl asks for. Without
+    // this, kubectl's `Sec-WebSocket-Protocol` request goes unanswered and the
+    // handshake fails. We forward whichever one we picked to the agent.
+    ws.protocols([
+        "v5.channel.k8s.io",
+        "v4.channel.k8s.io",
+        "v3.channel.k8s.io",
+        "v2.channel.k8s.io",
+        "channel.k8s.io",
+    ])
+    .on_upgrade(move |socket| {
+        let chosen = socket.protocol().and_then(|p| p.to_str().ok()).map(|s| s.to_string());
+        handle_exec_websocket(socket, exec_url, chosen)
+    })
 }
 
-/// Handle the WebSocket connection for exec, proxying to node agent
-async fn handle_exec_websocket(mut client_socket: WebSocket, node_url: String) {
-    // Connect to the node agent's WebSocket
-    let (node_socket, _) = match connect_async(&node_url).await {
+/// Bidirectional WebSocket proxy between kubectl and the node agent. Both
+/// frames are binary channel-prefixed (kubernetes streaming protocol); we
+/// don't need to inspect them, just shuttle bytes.
+async fn handle_exec_websocket(
+    client_socket: WebSocket,
+    node_url: String,
+    subprotocol: Option<String>,
+) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut req = match node_url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            let mut s = client_socket;
+            let _ = s
+                .send(Message::Text(format!("bad node url: {}", e)))
+                .await;
+            return;
+        }
+    };
+    if let Some(proto) = subprotocol.as_deref() {
+        if let Ok(value) = proto.parse() {
+            req.headers_mut().insert("Sec-WebSocket-Protocol", value);
+        }
+    }
+
+    let (node_socket, _) = match connect_async(req).await {
         Ok(conn) => conn,
         Err(e) => {
-            let _ = client_socket
-                .send(Message::Text(format!("Failed to connect to node: {}", e)))
+            let mut s = client_socket;
+            let _ = s
+                .send(Message::Binary(error_channel_frame(&format!(
+                    "failed to connect to node: {}",
+                    e
+                ))))
                 .await;
-            let _ = client_socket.close().await;
+            let _ = s.close().await;
             return;
         }
     };
@@ -628,7 +796,6 @@ async fn handle_exec_websocket(mut client_socket: WebSocket, node_url: String) {
     let (mut node_write, mut node_read) = node_socket.split();
     let (mut client_write, mut client_read) = client_socket.split();
 
-    // Proxy messages between client and node agent
     let client_to_node = async {
         while let Some(msg) = client_read.next().await {
             match msg {
@@ -683,11 +850,17 @@ async fn handle_exec_websocket(mut client_socket: WebSocket, node_url: String) {
         }
     };
 
-    // Run both directions concurrently
     tokio::select! {
         _ = client_to_node => {},
         _ = node_to_client => {},
     }
+}
+
+fn error_channel_frame(msg: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(msg.len() + 1);
+    out.push(3u8);
+    out.extend_from_slice(msg.as_bytes());
+    out
 }
 
 /// Query parameters for port-forward requests
@@ -892,11 +1065,15 @@ pub async fn create_service(
     if service.metadata.namespace.is_none() {
         service.metadata.namespace = Some(namespace);
     }
-    // Auto-assign ClusterIP if not set
-    if service.spec.cluster_ip.is_none() && service.spec.service_type == ServiceType::ClusterIP {
+    // Auto-assign ClusterIP for any type that should have one. Per the
+    // Kubernetes docs, ClusterIP / NodePort / LoadBalancer all get one;
+    // only ExternalName services don't.
+    let needs_cluster_ip = !matches!(service.spec.service_type, ServiceType::ExternalName);
+    if service.spec.cluster_ip.is_none() && needs_cluster_ip {
         let uid = service.metadata.uid.unwrap_or_else(uuid::Uuid::new_v4);
         let octet = (uid.as_u128() % 254 + 1) as u8;
-        service.spec.cluster_ip = Some(format!("10.96.0.{}", octet));
+        let prefix = service_cidr_prefix(&state.service_cidr);
+        service.spec.cluster_ip = Some(format!("{}.{}", prefix, octet));
     }
     let created = ServiceRepository::create(&state.pool, &service).await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -1487,4 +1664,382 @@ pub async fn delete_daemonset(
         "apiVersion": "v1", "kind": "Status", "metadata": {}, "status": "Success",
         "details": {"name": name, "group": "apps", "kind": "daemonsets"}
     })))
+}
+
+// ============================================================================
+// ServiceAccount handlers
+// ============================================================================
+
+pub async fn list_service_accounts(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = ServiceAccountRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(
+        &headers, "v1", "ServiceAccountList", items,
+        printers::SERVICEACCOUNT_COLUMNS, printers::serviceaccount_row,
+    ))
+}
+
+pub async fn list_all_service_accounts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = ServiceAccountRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(
+        &headers, "v1", "ServiceAccountList", items,
+        printers::SERVICEACCOUNT_COLUMNS, printers::serviceaccount_row,
+    ))
+}
+
+pub async fn get_service_account(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = ServiceAccountRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(&headers, item, printers::SERVICEACCOUNT_COLUMNS, printers::serviceaccount_row))
+}
+
+pub async fn create_service_account(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut sa): Json<ServiceAccount>,
+) -> Result<(StatusCode, Json<ServiceAccount>)> {
+    if sa.metadata.namespace.is_none() { sa.metadata.namespace = Some(namespace); }
+    Ok((StatusCode::CREATED, Json(ServiceAccountRepository::create(&state.pool, &sa).await?)))
+}
+
+pub async fn update_service_account(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut sa): Json<ServiceAccount>,
+) -> Result<Json<ServiceAccount>> {
+    sa.metadata.namespace = Some(namespace);
+    sa.metadata.name = Some(name);
+    Ok(Json(ServiceAccountRepository::create(&state.pool, &sa).await?))
+}
+
+pub async fn delete_service_account(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    ServiceAccountRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "kind":"serviceaccounts"}})))
+}
+
+// ============================================================================
+// Secret handlers
+// ============================================================================
+
+pub async fn list_secrets(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = SecretRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(&headers, "v1", "SecretList", items,
+        printers::SECRET_COLUMNS, printers::secret_row))
+}
+
+pub async fn list_all_secrets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = SecretRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(&headers, "v1", "SecretList", items,
+        printers::SECRET_COLUMNS, printers::secret_row))
+}
+
+pub async fn get_secret(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = SecretRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(&headers, item, printers::SECRET_COLUMNS, printers::secret_row))
+}
+
+pub async fn create_secret(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut s): Json<Secret>,
+) -> Result<(StatusCode, Json<Secret>)> {
+    if s.metadata.namespace.is_none() { s.metadata.namespace = Some(namespace); }
+    Ok((StatusCode::CREATED, Json(SecretRepository::create(&state.pool, &s).await?)))
+}
+
+pub async fn update_secret(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut s): Json<Secret>,
+) -> Result<Json<Secret>> {
+    s.metadata.namespace = Some(namespace);
+    s.metadata.name = Some(name);
+    Ok(Json(SecretRepository::create(&state.pool, &s).await?))
+}
+
+pub async fn delete_secret(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    SecretRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "kind":"secrets"}})))
+}
+
+// ============================================================================
+// ConfigMap handlers
+// ============================================================================
+
+pub async fn list_config_maps(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = ConfigMapRepository::list(&state.pool, Some(&namespace)).await?;
+    Ok(table::list_response(&headers, "v1", "ConfigMapList", items,
+        printers::CONFIGMAP_COLUMNS, printers::configmap_row))
+}
+
+pub async fn list_all_config_maps(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = ConfigMapRepository::list(&state.pool, None).await?;
+    Ok(table::list_response(&headers, "v1", "ConfigMapList", items,
+        printers::CONFIGMAP_COLUMNS, printers::configmap_row))
+}
+
+pub async fn get_config_map(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = ConfigMapRepository::get(&state.pool, &namespace, &name).await?;
+    Ok(table::item_response(&headers, item, printers::CONFIGMAP_COLUMNS, printers::configmap_row))
+}
+
+pub async fn create_config_map(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(mut cm): Json<ConfigMap>,
+) -> Result<(StatusCode, Json<ConfigMap>)> {
+    if cm.metadata.namespace.is_none() { cm.metadata.namespace = Some(namespace); }
+    Ok((StatusCode::CREATED, Json(ConfigMapRepository::create(&state.pool, &cm).await?)))
+}
+
+pub async fn update_config_map(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(mut cm): Json<ConfigMap>,
+) -> Result<Json<ConfigMap>> {
+    cm.metadata.namespace = Some(namespace);
+    cm.metadata.name = Some(name);
+    Ok(Json(ConfigMapRepository::create(&state.pool, &cm).await?))
+}
+
+pub async fn delete_config_map(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    ConfigMapRepository::delete(&state.pool, &namespace, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "kind":"configmaps"}})))
+}
+
+// ============================================================================
+// ClusterRole handlers (cluster-scoped, rbac.authorization.k8s.io/v1)
+// ============================================================================
+
+pub async fn list_cluster_roles(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = ClusterRoleRepository::list(&state.pool).await?;
+    Ok(table::list_response(&headers, "rbac.authorization.k8s.io/v1", "ClusterRoleList", items,
+        printers::CLUSTERROLE_COLUMNS, printers::clusterrole_row))
+}
+
+pub async fn get_cluster_role(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = ClusterRoleRepository::get(&state.pool, &name).await?;
+    Ok(table::item_response(&headers, item, printers::CLUSTERROLE_COLUMNS, printers::clusterrole_row))
+}
+
+pub async fn create_cluster_role(
+    State(state): State<Arc<AppState>>,
+    Json(cr): Json<ClusterRole>,
+) -> Result<(StatusCode, Json<ClusterRole>)> {
+    Ok((StatusCode::CREATED, Json(ClusterRoleRepository::create(&state.pool, &cr).await?)))
+}
+
+pub async fn update_cluster_role(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(mut cr): Json<ClusterRole>,
+) -> Result<Json<ClusterRole>> {
+    cr.metadata.name = Some(name);
+    Ok(Json(ClusterRoleRepository::create(&state.pool, &cr).await?))
+}
+
+pub async fn delete_cluster_role(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    ClusterRoleRepository::delete(&state.pool, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"clusterroles"}})))
+}
+
+// ============================================================================
+// ClusterRoleBinding handlers
+// ============================================================================
+
+pub async fn list_cluster_role_bindings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let items = ClusterRoleBindingRepository::list(&state.pool).await?;
+    Ok(table::list_response(&headers, "rbac.authorization.k8s.io/v1", "ClusterRoleBindingList", items,
+        printers::CLUSTERROLEBINDING_COLUMNS, printers::clusterrolebinding_row))
+}
+
+pub async fn get_cluster_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let item = ClusterRoleBindingRepository::get(&state.pool, &name).await?;
+    Ok(table::item_response(&headers, item, printers::CLUSTERROLEBINDING_COLUMNS, printers::clusterrolebinding_row))
+}
+
+pub async fn create_cluster_role_binding(
+    State(state): State<Arc<AppState>>,
+    Json(b): Json<ClusterRoleBinding>,
+) -> Result<(StatusCode, Json<ClusterRoleBinding>)> {
+    Ok((StatusCode::CREATED, Json(ClusterRoleBindingRepository::create(&state.pool, &b).await?)))
+}
+
+pub async fn update_cluster_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(mut b): Json<ClusterRoleBinding>,
+) -> Result<Json<ClusterRoleBinding>> {
+    b.metadata.name = Some(name);
+    Ok(Json(ClusterRoleBindingRepository::create(&state.pool, &b).await?))
+}
+
+pub async fn delete_cluster_role_binding(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    ClusterRoleBindingRepository::delete(&state.pool, &name).await?;
+    Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
+        "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"clusterrolebindings"}})))
+}
+
+// ============================================================================
+// rbac.authorization.k8s.io/v1 discovery
+// ============================================================================
+
+pub async fn rbac_v1_resources() -> Json<Value> {
+    Json(json!({
+        "kind": "APIResourceList",
+        "groupVersion": "rbac.authorization.k8s.io/v1",
+        "resources": [
+            {"name":"clusterroles","singularName":"clusterrole","namespaced":false,
+             "kind":"ClusterRole","verbs":["create","delete","get","list","update"]},
+            {"name":"clusterrolebindings","singularName":"clusterrolebinding","namespaced":false,
+             "kind":"ClusterRoleBinding","verbs":["create","delete","get","list","update"]}
+        ]
+    }))
+}
+
+// ============================================================================
+// ReplicationController — stub. We don't actually implement the controller,
+// but `kubectl get all` always queries this kind, so we serve empty lists
+// (with table format) to avoid 404s.
+// ============================================================================
+
+const RC_COLUMNS: &[crate::server::table::Column] = &[
+    crate::server::table::Column::new("Name", "string"),
+    crate::server::table::Column::new("Desired", "integer"),
+    crate::server::table::Column::new("Current", "integer"),
+    crate::server::table::Column::new("Ready", "integer"),
+    crate::server::table::Column::new("Age", "string"),
+];
+
+fn empty_rc_response(headers: &HeaderMap) -> Response {
+    let items: Vec<serde_json::Value> = Vec::new();
+    table::list_response(
+        headers,
+        "v1",
+        "ReplicationControllerList",
+        items,
+        RC_COLUMNS,
+        |_| Vec::new(),
+    )
+}
+
+pub async fn list_replication_controllers(
+    State(_state): State<Arc<AppState>>,
+    Path(_namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    Ok(empty_rc_response(&headers))
+}
+
+pub async fn list_all_replication_controllers(
+    State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    Ok(empty_rc_response(&headers))
+}
+
+// ============================================================================
+// ReplicaSet — stub. Like ReplicationController, kubectl always queries this
+// kind for `get all`. We don't implement it (Deployments don't materialize
+// ReplicaSets in superkube — they own pods directly), but we serve empty
+// lists so kubectl is happy.
+// ============================================================================
+
+const RS_COLUMNS: &[crate::server::table::Column] = &[
+    crate::server::table::Column::new("Name", "string"),
+    crate::server::table::Column::new("Desired", "integer"),
+    crate::server::table::Column::new("Current", "integer"),
+    crate::server::table::Column::new("Ready", "integer"),
+    crate::server::table::Column::new("Age", "string"),
+];
+
+fn empty_rs_response(headers: &HeaderMap) -> Response {
+    let items: Vec<serde_json::Value> = Vec::new();
+    table::list_response(
+        headers,
+        "apps/v1",
+        "ReplicaSetList",
+        items,
+        RS_COLUMNS,
+        |_| Vec::new(),
+    )
+}
+
+pub async fn list_replica_sets(
+    State(_state): State<Arc<AppState>>,
+    Path(_namespace): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    Ok(empty_rs_response(&headers))
+}
+
+pub async fn list_all_replica_sets(
+    State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    Ok(empty_rs_response(&headers))
 }

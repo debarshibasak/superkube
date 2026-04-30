@@ -361,3 +361,89 @@ pub fn event_row(e: &Event) -> Vec<Value> {
         json!(message),
     ]
 }
+
+// --- ServiceAccount ----------------------------------------------------
+
+pub const SERVICEACCOUNT_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Secrets", "integer"),
+    Column::new("Age", "string"),
+];
+
+pub fn serviceaccount_row(sa: &ServiceAccount) -> Vec<Value> {
+    let secrets = sa.secrets.as_ref().map(|s| s.len()).unwrap_or(0);
+    vec![
+        json!(sa.metadata.name()),
+        json!(secrets),
+        json!(age_str(sa.metadata.creation_timestamp)),
+    ]
+}
+
+// --- Secret ------------------------------------------------------------
+
+pub const SECRET_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Type", "string"),
+    Column::new("Data", "integer"),
+    Column::new("Age", "string"),
+];
+
+pub fn secret_row(s: &Secret) -> Vec<Value> {
+    let n = s.data.as_ref().map(|m| m.len()).unwrap_or(0)
+        + s.string_data.as_ref().map(|m| m.len()).unwrap_or(0);
+    vec![
+        json!(s.metadata.name()),
+        json!(s.secret_type),
+        json!(n),
+        json!(age_str(s.metadata.creation_timestamp)),
+    ]
+}
+
+// --- ConfigMap ---------------------------------------------------------
+
+pub const CONFIGMAP_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Data", "integer"),
+    Column::new("Age", "string"),
+];
+
+pub fn configmap_row(cm: &ConfigMap) -> Vec<Value> {
+    let n = cm.data.as_ref().map(|m| m.len()).unwrap_or(0)
+        + cm.binary_data.as_ref().map(|m| m.len()).unwrap_or(0);
+    vec![
+        json!(cm.metadata.name()),
+        json!(n),
+        json!(age_str(cm.metadata.creation_timestamp)),
+    ]
+}
+
+// --- ClusterRole / ClusterRoleBinding ----------------------------------
+
+pub const CLUSTERROLE_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Created At", "string"),
+];
+
+pub fn clusterrole_row(cr: &ClusterRole) -> Vec<Value> {
+    let created = cr
+        .metadata
+        .creation_timestamp
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    vec![json!(cr.metadata.name()), json!(created)]
+}
+
+pub const CLUSTERROLEBINDING_COLUMNS: &[Column] = &[
+    Column::new("Name", "string"),
+    Column::new("Role", "string"),
+    Column::new("Age", "string"),
+];
+
+pub fn clusterrolebinding_row(b: &ClusterRoleBinding) -> Vec<Value> {
+    let role = format!("{}/{}", b.role_ref.kind, b.role_ref.name);
+    vec![
+        json!(b.metadata.name()),
+        json!(role),
+        json!(age_str(b.metadata.creation_timestamp)),
+    ]
+}

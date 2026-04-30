@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, LogsOptions, StartContainerOptions,
 };
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::service::{HostConfig, PortBinding};
 use bollard::Docker;
@@ -22,7 +23,7 @@ use futures::StreamExt;
 
 use crate::models::{Container, Protocol};
 
-use super::{ContainerInfo, LogOptions, LogStream, PortMapping, Runtime};
+use super::{ContainerInfo, ExecSession, LogOptions, LogStream, PortMapping, Runtime};
 
 const ID_PREFIX: &str = "docker://";
 
@@ -126,7 +127,7 @@ impl Runtime for DockerRuntime {
         });
 
         // Port publishing — every declared containerPort gets bound to a
-        // *random* host port so kais's NodePort proxy can reach it via
+        // *random* host port so superkube's NodePort proxy can reach it via
         // 127.0.0.1:<host_port>. We use random ports because we don't know
         // ahead of time what's free on the host, and the published mapping
         // is reported back via `find_container`.
@@ -313,6 +314,84 @@ impl Runtime for DockerRuntime {
         }
 
         Ok(out)
+    }
+
+    async fn exec(
+        &self,
+        container_id: &str,
+        cmd: Vec<String>,
+        tty: bool,
+    ) -> anyhow::Result<ExecSession> {
+        let id = Self::strip(container_id);
+        let exec = self
+            .client
+            .create_exec(
+                id,
+                CreateExecOptions {
+                    cmd: Some(cmd),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(tty),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("docker create_exec: {e}"))?;
+
+        let result = self
+            .client
+            .start_exec(&exec.id, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("docker start_exec: {e}"))?;
+
+        match result {
+            StartExecResults::Attached { output, input } => {
+                let mapped = output.map(|item| match item {
+                    Ok(LogOutput::StdOut { message })
+                    | Ok(LogOutput::StdErr { message })
+                    | Ok(LogOutput::Console { message })
+                    | Ok(LogOutput::StdIn { message }) => Ok(Bytes::from(message.to_vec())),
+                    Err(e) => Err(anyhow::anyhow!("exec output: {e}")),
+                });
+
+                // The closure captures the bollard client + exec id so the
+                // session can resize the TTY without holding the runtime ref.
+                let client = self.client.clone();
+                let exec_id = exec.id.clone();
+                let resize: Box<
+                    dyn Fn(u16, u16) -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+                        > + Send
+                        + Sync,
+                > = Box::new(move |h: u16, w: u16| {
+                    let client = client.clone();
+                    let id = exec_id.clone();
+                    Box::pin(async move {
+                        client
+                            .resize_exec(
+                                &id,
+                                ResizeExecOptions {
+                                    height: h,
+                                    width: w,
+                                },
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("docker resize_exec: {e}"))
+                    })
+                });
+
+                Ok(ExecSession {
+                    id: exec.id,
+                    output: Box::pin(mapped),
+                    input,
+                    resize,
+                })
+            }
+            StartExecResults::Detached => {
+                anyhow::bail!("docker exec detached unexpectedly");
+            }
+        }
     }
 
     async fn stream_logs(

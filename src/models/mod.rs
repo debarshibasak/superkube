@@ -1,3 +1,5 @@
+mod affinity;
+mod auth;
 mod daemonset;
 mod deployment;
 mod event;
@@ -8,6 +10,8 @@ mod pod;
 mod service;
 mod statefulset;
 
+pub use affinity::*;
+pub use auth::*;
 pub use daemonset::*;
 pub use deployment::*;
 pub use event::*;

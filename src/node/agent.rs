@@ -38,7 +38,40 @@ pub async fn run(
     containerd_socket: &str,
     labels: HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let agent = NodeAgent::new(name, server_url, containerd_socket, labels).await?;
+    run_with_pod_cidr(name, server_url, containerd_socket, labels, "10.244.0.0/16").await
+}
+
+/// Like [`run`], but lets the caller pin the pod CIDR. The agent uses the /24
+/// prefix to allocate pod IPs.
+pub async fn run_with_pod_cidr(
+    name: &str,
+    server_url: &str,
+    containerd_socket: &str,
+    labels: HashMap<String, String>,
+    pod_cidr: &str,
+) -> anyhow::Result<()> {
+    run_full(name, server_url, containerd_socket, labels, pod_cidr, "auto").await
+}
+
+/// Most-flexible entry point: also accepts a runtime selector string
+/// (`auto`/`docker`/`embedded`/`mock`) to back `--runtime=` on the CLI.
+pub async fn run_full(
+    name: &str,
+    server_url: &str,
+    containerd_socket: &str,
+    labels: HashMap<String, String>,
+    pod_cidr: &str,
+    runtime_kind: &str,
+) -> anyhow::Result<()> {
+    let agent = NodeAgent::new_with_runtime(
+        name,
+        server_url,
+        containerd_socket,
+        labels,
+        pod_cidr.to_string(),
+        runtime_kind,
+    )
+    .await?;
     agent.run().await
 }
 
@@ -49,6 +82,9 @@ pub(super) struct AgentState {
     pub server_url: String,
     pub client: Client,
     pub runtime: Box<dyn Runtime>,
+    /// Pod CIDR — first three octets become the /24 prefix used to assemble
+    /// pod IPs from the pod UID.
+    pub pod_cidr_prefix: String,
     /// Map of pod UID to container ID
     pub containers: HashMap<Uuid, String>,
     /// Map of (namespace, pod_name, container_name) to container ID for log lookup
@@ -70,9 +106,32 @@ impl NodeAgent {
         server_url: &str,
         containerd_socket: &str,
         labels: HashMap<String, String>,
+        pod_cidr: String,
     ) -> anyhow::Result<Self> {
-        let runtime = runtime::default(containerd_socket).await?;
+        Self::new_with_runtime(
+            name,
+            server_url,
+            containerd_socket,
+            labels,
+            pod_cidr,
+            "auto",
+        )
+        .await
+    }
+
+    async fn new_with_runtime(
+        name: &str,
+        server_url: &str,
+        containerd_socket: &str,
+        labels: HashMap<String, String>,
+        pod_cidr: String,
+        runtime_kind: &str,
+    ) -> anyhow::Result<Self> {
+        let runtime = runtime::select(containerd_socket, runtime_kind).await?;
         tracing::info!("node agent runtime: {}", runtime.name());
+
+        let pod_cidr_prefix = pod_cidr_to_prefix(&pod_cidr);
+        tracing::info!("pod CIDR: {} (assigning IPs as {}.X)", pod_cidr, pod_cidr_prefix);
 
         let state = AgentState {
             name: name.to_string(),
@@ -80,6 +139,7 @@ impl NodeAgent {
             server_url: server_url.trim_end_matches('/').to_string(),
             client: Client::new(),
             runtime,
+            pod_cidr_prefix,
             containers: HashMap::new(),
             pod_containers: HashMap::new(),
             pod_ports: HashMap::new(),
@@ -428,7 +488,10 @@ impl NodeAgent {
             PodPhase::Pending
         };
 
-        let pod_ip = format!("10.244.0.{}", (pod_uid.as_u128() % 254 + 1) as u8);
+        let pod_ip = {
+            let s = self.state.read().await;
+            format!("{}.{}", s.pod_cidr_prefix, (pod_uid.as_u128() % 254 + 1) as u8)
+        };
 
         self.publish_pod_status(
             &namespace,
@@ -495,7 +558,7 @@ impl NodeAgent {
             count: Some(1),
             event_type: Some(typ),
             action: None,
-            reporting_controller: Some("kais/kubelet".to_string()),
+            reporting_controller: Some("superkube/kubelet".to_string()),
             reporting_instance: Some(state.name.clone()),
         };
 
@@ -652,8 +715,8 @@ fn build_node_object(name: &str, labels: &HashMap<String, String>) -> Node {
     let node_info = NodeSystemInfo {
         kernel_version: Some(uname_field("-r").unwrap_or_else(|| "unknown".into())),
         os_image: Some(detect_os_image()),
-        container_runtime_version: Some(format!("kais://{}", env!("CARGO_PKG_VERSION"))),
-        kubelet_version: Some(format!("kais/{}", env!("CARGO_PKG_VERSION"))),
+        container_runtime_version: Some(format!("superkube://{}", env!("CARGO_PKG_VERSION"))),
+        kubelet_version: Some(format!("superkube/{}", env!("CARGO_PKG_VERSION"))),
         operating_system: Some(std::env::consts::OS.to_string()),
         architecture: Some(std::env::consts::ARCH.to_string()),
         ..Default::default()
@@ -686,6 +749,19 @@ fn build_node_object(name: &str, labels: &HashMap<String, String>) -> Node {
             phase: NodePhase::Running,
             ..Default::default()
         }),
+    }
+}
+
+/// Pull the first three octets out of a pod CIDR (e.g. "10.244.0.0/16" →
+/// "10.244.0"). Pod IPs are then assembled as `<prefix>.<last_octet>`. If the
+/// input doesn't parse, fall back to the safe default.
+fn pod_cidr_to_prefix(cidr: &str) -> String {
+    let addr_part = cidr.split('/').next().unwrap_or(cidr);
+    let octets: Vec<&str> = addr_part.split('.').collect();
+    if octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+        format!("{}.{}.{}", octets[0], octets[1], octets[2])
+    } else {
+        "10.244.0".to_string()
     }
 }
 
@@ -1103,103 +1179,187 @@ fn default_true() -> bool {
     true
 }
 
-/// Handle exec requests via WebSocket
+/// Handle exec requests via WebSocket. Uses the Kubernetes channel-prefixed
+/// frame protocol: every binary frame from kubectl is `[channel_byte, data...]`.
+///   channel 0 = stdin, 1 = stdout, 2 = stderr, 3 = error, 4 = resize.
+///
+/// kubectl sends each argv entry as a separate `command=` query param, so we
+/// parse the raw query rather than `Query<T>` which would only pick the last.
 async fn handle_exec(
     State(state): State<Arc<RwLock<AgentState>>>,
     Path((namespace, pod, container)): Path<(String, String, String)>,
-    Query(params): Query<ExecQueryParams>,
+    raw_query: axum::extract::RawQuery,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Verify the container exists
-    let container_exists = {
+    let container_id = {
         let state = state.read().await;
-        state
+        match state
             .pod_containers
-            .contains_key(&(namespace.clone(), pod.clone(), container.clone()))
+            .get(&(namespace.clone(), pod.clone(), container.clone()))
+            .cloned()
+        {
+            Some(id) => id,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("Container {} not found in pod {}/{}", container, namespace, pod),
+                )
+                    .into_response();
+            }
+        }
     };
 
-    if !container_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            format!(
-                "Container {} not found in pod {}/{}",
-                container, namespace, pod
-            ),
-        )
-            .into_response();
-    }
+    let (cmd, tty) = parse_exec_query(raw_query.0.as_deref().unwrap_or(""));
+    let session_state = state.clone();
 
-    let command = params.command.clone().unwrap_or_else(|| "sh".to_string());
-
-    ws.on_upgrade(move |socket| handle_exec_websocket(socket, command, params))
+    ws.protocols([
+        "v5.channel.k8s.io",
+        "v4.channel.k8s.io",
+        "v3.channel.k8s.io",
+        "v2.channel.k8s.io",
+        "channel.k8s.io",
+    ])
+    .on_upgrade(move |socket| async move {
+        handle_exec_websocket(socket, session_state, container_id, cmd, tty).await;
+    })
 }
 
-/// Handle the WebSocket connection for exec
-async fn handle_exec_websocket(mut socket: WebSocket, command: String, params: ExecQueryParams) {
-    tracing::info!("Exec session started for command: {}", command);
+/// Pull every `command=<word>` and `tty=<bool>` out of a query string.
+/// kubectl sends `?command=echo&command=hello&tty=false` style URLs.
+fn parse_exec_query(q: &str) -> (Vec<String>, bool) {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(q).unwrap_or_default();
+    let cmd: Vec<String> = pairs
+        .iter()
+        .filter(|(k, _)| k == "command")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let tty = pairs
+        .iter()
+        .find(|(k, _)| k == "tty")
+        .map(|(_, v)| v == "true" || v == "1")
+        .unwrap_or(false);
+    let cmd = if cmd.is_empty() {
+        vec!["sh".to_string()]
+    } else {
+        cmd
+    };
+    (cmd, tty)
+}
 
-    // In a real implementation, this would:
-    // 1. Use containerd's exec API to create an exec process in the container
-    // 2. Connect stdin/stdout/stderr streams
-    // 3. Optionally allocate a PTY
+async fn handle_exec_websocket(
+    socket: WebSocket,
+    state: Arc<RwLock<AgentState>>,
+    container_id: String,
+    cmd: Vec<String>,
+    tty: bool,
+) {
+    tracing::info!("exec session: container={} cmd={:?} tty={}", container_id, cmd, tty);
 
-    // For now, we'll provide a mock implementation
-    // Send initial message
-    let _ = socket
-        .send(Message::Text(format!(
-            "Executing command '{}' (stdin={}, stdout={}, stderr={}, tty={})\r\n",
-            command, params.stdin, params.stdout, params.stderr, params.tty
-        )))
-        .await;
+    // Spin up the exec session — this is the only point we hold the runtime
+    // lock, and only briefly.
+    let session = {
+        let s = state.read().await;
+        match s.runtime.exec(&container_id, cmd.clone(), tty).await {
+            Ok(sess) => sess,
+            Err(e) => {
+                tracing::error!("exec start failed: {}", e);
+                let mut socket = socket;
+                let _ = socket
+                    .send(Message::Binary(error_frame(&format!(
+                        "exec failed: {}",
+                        e
+                    ))))
+                    .await;
+                let _ = socket.close().await;
+                return;
+            }
+        }
+    };
 
-    // Mock shell simulation
-    loop {
-        match socket.recv().await {
-            Some(Ok(Message::Text(text))) => {
-                // Echo the command and provide mock output
-                let response = match text.trim() {
-                    "exit" | "quit" => {
-                        let _ = socket.send(Message::Text("exit\r\n".to_string())).await;
+    let mut output = session.output;
+    let mut input = session.input;
+    let resize = session.resize;
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // docker output → kubectl stdout (channel 1)
+    let docker_to_ws = async move {
+        while let Some(chunk) = output.next().await {
+            match chunk {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let mut frame = Vec::with_capacity(bytes.len() + 1);
+                    frame.push(1u8); // stdout channel
+                    frame.extend_from_slice(&bytes);
+                    if ws_tx.send(Message::Binary(frame)).await.is_err() {
                         break;
                     }
-                    "ls" => "bin  dev  etc  home  lib  proc  root  sys  tmp  usr  var\r\n",
-                    "pwd" => "/\r\n",
-                    "whoami" => "root\r\n",
-                    "hostname" => "container-mock\r\n",
-                    "ps" => "PID   USER     TIME  COMMAND\r\n    1 root      0:00 /bin/sh\r\n",
-                    "date" => &format!("{}\r\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")),
-                    "" => "",
-                    cmd => &format!("sh: {}: command not found\r\n", cmd),
-                };
-
-                if !response.is_empty() {
-                    let _ = socket.send(Message::Text(response.to_string())).await;
                 }
-
-                // Send prompt
-                if params.tty {
-                    let _ = socket.send(Message::Text("# ".to_string())).await;
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("exec output err: {}", e);
+                    break;
                 }
             }
-            Some(Ok(Message::Binary(data))) => {
-                // Handle binary data (e.g., raw terminal input)
-                if let Ok(text) = String::from_utf8(data) {
-                    let _ = socket.send(Message::Text(format!("received: {}\r\n", text))).await;
-                }
-            }
-            Some(Ok(Message::Close(_))) | None => {
-                tracing::info!("Exec session ended");
-                break;
-            }
-            Some(Err(e)) => {
-                tracing::error!("Exec WebSocket error: {}", e);
-                break;
-            }
-            _ => {}
         }
-    }
+        // Tell kubectl the exec finished successfully. Without this
+        // sentinel on the error channel, kubectl logs an "abnormal closure"
+        // warning when the WS just goes away after stdout ends.
+        let status = br#"{"metadata":{},"status":"Success"}"#;
+        let mut frame = Vec::with_capacity(status.len() + 1);
+        frame.push(3u8); // error channel
+        frame.extend_from_slice(status);
+        let _ = ws_tx.send(Message::Binary(frame)).await;
+        let _ = ws_tx.close().await;
+    };
 
-    let _ = socket.close().await;
+    // kubectl frames → docker stdin / resize
+    let ws_to_docker = async move {
+        use tokio::io::AsyncWriteExt;
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Binary(data)) if !data.is_empty() => {
+                    let channel = data[0];
+                    let payload = &data[1..];
+                    match channel {
+                        0 => {
+                            if input.write_all(payload).await.is_err() {
+                                break;
+                            }
+                            let _ = input.flush().await;
+                        }
+                        4 => {
+                            // {"Width":W,"Height":H}
+                            if let Ok(s) = std::str::from_utf8(payload) {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                                    let w = v.get("Width").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                                    let h = v.get("Height").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                                    let _ = (resize)(h, w).await;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = docker_to_ws => {}
+        _ = ws_to_docker => {}
+    }
+    tracing::info!("exec session ended");
+}
+
+/// Build a Kubernetes error-channel frame (channel 3).
+fn error_frame(msg: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(msg.len() + 1);
+    out.push(3u8);
+    out.extend_from_slice(msg.as_bytes());
+    out
 }
 
 // ============================================================================

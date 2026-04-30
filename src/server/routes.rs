@@ -17,7 +17,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api", get(api::api_versions))
         .route("/api/v1", get(api::api_v1_resources))
         .route("/apis", get(api::api_groups))
+        .route("/openapi/v2", get(api::openapi_v2))
+        .route("/openapi/v3", get(api::openapi_v3))
         .route("/apis/apps/v1", get(api::apps_v1_resources))
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1",
+            get(api::rbac_v1_resources),
+        )
         // Pods
         .route(
             "/api/v1/namespaces/:namespace/pods",
@@ -128,4 +134,80 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(api::get_event).delete(api::delete_event),
         )
         .route("/api/v1/events", get(api::list_all_events))
+        // ServiceAccounts
+        .route(
+            "/api/v1/namespaces/:namespace/serviceaccounts",
+            get(api::list_service_accounts).post(api::create_service_account),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/serviceaccounts/:name",
+            get(api::get_service_account)
+                .put(api::update_service_account)
+                .delete(api::delete_service_account),
+        )
+        .route("/api/v1/serviceaccounts", get(api::list_all_service_accounts))
+        // Secrets
+        .route(
+            "/api/v1/namespaces/:namespace/secrets",
+            get(api::list_secrets).post(api::create_secret),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/secrets/:name",
+            get(api::get_secret)
+                .put(api::update_secret)
+                .delete(api::delete_secret),
+        )
+        .route("/api/v1/secrets", get(api::list_all_secrets))
+        // ConfigMaps
+        .route(
+            "/api/v1/namespaces/:namespace/configmaps",
+            get(api::list_config_maps).post(api::create_config_map),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/configmaps/:name",
+            get(api::get_config_map)
+                .put(api::update_config_map)
+                .delete(api::delete_config_map),
+        )
+        .route("/api/v1/configmaps", get(api::list_all_config_maps))
+        // ClusterRoles
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles",
+            get(api::list_cluster_roles).post(api::create_cluster_role),
+        )
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/:name",
+            get(api::get_cluster_role)
+                .put(api::update_cluster_role)
+                .delete(api::delete_cluster_role),
+        )
+        // ReplicationControllers (stub — kubectl get all queries this)
+        .route(
+            "/api/v1/namespaces/:namespace/replicationcontrollers",
+            get(api::list_replication_controllers),
+        )
+        .route(
+            "/api/v1/replicationcontrollers",
+            get(api::list_all_replication_controllers),
+        )
+        // ReplicaSets (stub — same reason)
+        .route(
+            "/apis/apps/v1/namespaces/:namespace/replicasets",
+            get(api::list_replica_sets),
+        )
+        .route(
+            "/apis/apps/v1/replicasets",
+            get(api::list_all_replica_sets),
+        )
+        // ClusterRoleBindings
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+            get(api::list_cluster_role_bindings).post(api::create_cluster_role_binding),
+        )
+        .route(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/:name",
+            get(api::get_cluster_role_binding)
+                .put(api::update_cluster_role_binding)
+                .delete(api::delete_cluster_role_binding),
+        )
 }

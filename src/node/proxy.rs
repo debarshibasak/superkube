@@ -1,4 +1,4 @@
-//! Service proxy — kais's tiny userspace kube-proxy.
+//! Service proxy — superkube's tiny userspace kube-proxy.
 //!
 //! Periodically fetches all NodePort services from the API. For each one,
 //! ensures a TCP listener is running on `0.0.0.0:<nodePort>`. Connections that

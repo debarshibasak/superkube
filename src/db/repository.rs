@@ -1734,3 +1734,336 @@ impl DaemonSetRepository {
         }
     }
 }
+
+
+// ============================================================================
+// ServiceAccount
+// ============================================================================
+
+pub struct ServiceAccountRepository;
+
+impl ServiceAccountRepository {
+    pub async fn create(pool: &AnyPool, sa: &ServiceAccount) -> Result<ServiceAccount> {
+        let meta = &sa.metadata;
+        let uid = meta.uid.unwrap_or_else(Uuid::new_v4);
+        let name = meta.name().to_string();
+        let namespace = meta.namespace().to_string();
+        let labels = json_str(&meta.labels)?;
+        let annotations = json_str(&meta.annotations)?;
+        let spec = json_str(sa)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO serviceaccounts (uid, name, namespace, labels, annotations, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name, namespace) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string())
+        .bind(&name).bind(&namespace).bind(&labels).bind(&annotations).bind(&spec)
+        .bind(&now).bind(&now)
+        .execute(pool).await?;
+        Self::get(pool, &namespace, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, namespace: &str, name: &str) -> Result<ServiceAccount> {
+        let row = sqlx::query("SELECT uid, name, namespace, spec, created_at FROM serviceaccounts WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name)
+            .fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("serviceaccounts \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool, namespace: Option<&str>) -> Result<Vec<ServiceAccount>> {
+        let rows = if let Some(ns) = namespace {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM serviceaccounts WHERE namespace = ? ORDER BY created_at DESC").bind(ns).fetch_all(pool).await?
+        } else {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM serviceaccounts ORDER BY created_at DESC").fetch_all(pool).await?
+        };
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, namespace: &str, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM serviceaccounts WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("serviceaccounts \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> ServiceAccount {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let ns: String = row.get("namespace");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut sa: ServiceAccount = json_from(&spec);
+        sa.metadata.name = Some(name);
+        sa.metadata.namespace = Some(ns);
+        sa.metadata.uid = Some(parse_uid(&uid));
+        sa.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        sa
+    }
+}
+
+// ============================================================================
+// Secret
+// ============================================================================
+
+pub struct SecretRepository;
+
+impl SecretRepository {
+    pub async fn create(pool: &AnyPool, s: &Secret) -> Result<Secret> {
+        let meta = &s.metadata;
+        let uid = meta.uid.unwrap_or_else(Uuid::new_v4);
+        let name = meta.name().to_string();
+        let namespace = meta.namespace().to_string();
+        let labels = json_str(&meta.labels)?;
+        let annotations = json_str(&meta.annotations)?;
+        let spec = json_str(s)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO secrets (uid, name, namespace, labels, annotations, secret_type, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name, namespace) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                secret_type = EXCLUDED.secret_type, spec = EXCLUDED.spec,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string()).bind(&name).bind(&namespace)
+        .bind(&labels).bind(&annotations).bind(&s.secret_type).bind(&spec)
+        .bind(&now).bind(&now)
+        .execute(pool).await?;
+        Self::get(pool, &namespace, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, namespace: &str, name: &str) -> Result<Secret> {
+        let row = sqlx::query("SELECT uid, name, namespace, spec, created_at FROM secrets WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("secrets \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool, namespace: Option<&str>) -> Result<Vec<Secret>> {
+        let rows = if let Some(ns) = namespace {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM secrets WHERE namespace = ? ORDER BY created_at DESC").bind(ns).fetch_all(pool).await?
+        } else {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM secrets ORDER BY created_at DESC").fetch_all(pool).await?
+        };
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, namespace: &str, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM secrets WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("secrets \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> Secret {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let ns: String = row.get("namespace");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut s: Secret = json_from(&spec);
+        s.metadata.name = Some(name);
+        s.metadata.namespace = Some(ns);
+        s.metadata.uid = Some(parse_uid(&uid));
+        s.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        s
+    }
+}
+
+// ============================================================================
+// ConfigMap
+// ============================================================================
+
+pub struct ConfigMapRepository;
+
+impl ConfigMapRepository {
+    pub async fn create(pool: &AnyPool, cm: &ConfigMap) -> Result<ConfigMap> {
+        let meta = &cm.metadata;
+        let uid = meta.uid.unwrap_or_else(Uuid::new_v4);
+        let name = meta.name().to_string();
+        let namespace = meta.namespace().to_string();
+        let labels = json_str(&meta.labels)?;
+        let annotations = json_str(&meta.annotations)?;
+        let spec = json_str(cm)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO configmaps (uid, name, namespace, labels, annotations, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name, namespace) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string()).bind(&name).bind(&namespace)
+        .bind(&labels).bind(&annotations).bind(&spec).bind(&now).bind(&now)
+        .execute(pool).await?;
+        Self::get(pool, &namespace, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, namespace: &str, name: &str) -> Result<ConfigMap> {
+        let row = sqlx::query("SELECT uid, name, namespace, spec, created_at FROM configmaps WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("configmaps \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool, namespace: Option<&str>) -> Result<Vec<ConfigMap>> {
+        let rows = if let Some(ns) = namespace {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM configmaps WHERE namespace = ? ORDER BY created_at DESC").bind(ns).fetch_all(pool).await?
+        } else {
+            sqlx::query("SELECT uid, name, namespace, spec, created_at FROM configmaps ORDER BY created_at DESC").fetch_all(pool).await?
+        };
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, namespace: &str, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM configmaps WHERE namespace = ? AND name = ?")
+            .bind(namespace).bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("configmaps \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> ConfigMap {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let ns: String = row.get("namespace");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut cm: ConfigMap = json_from(&spec);
+        cm.metadata.name = Some(name);
+        cm.metadata.namespace = Some(ns);
+        cm.metadata.uid = Some(parse_uid(&uid));
+        cm.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        cm
+    }
+}
+
+// ============================================================================
+// ClusterRole (cluster-scoped)
+// ============================================================================
+
+pub struct ClusterRoleRepository;
+
+impl ClusterRoleRepository {
+    pub async fn create(pool: &AnyPool, cr: &ClusterRole) -> Result<ClusterRole> {
+        let uid = cr.metadata.uid.unwrap_or_else(Uuid::new_v4);
+        let name = cr.metadata.name().to_string();
+        let labels = json_str(&cr.metadata.labels)?;
+        let annotations = json_str(&cr.metadata.annotations)?;
+        let spec = json_str(cr)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO clusterroles (uid, name, labels, annotations, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string()).bind(&name).bind(&labels).bind(&annotations)
+        .bind(&spec).bind(&now).bind(&now).execute(pool).await?;
+        Self::get(pool, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, name: &str) -> Result<ClusterRole> {
+        let row = sqlx::query("SELECT uid, name, spec, created_at FROM clusterroles WHERE name = ?")
+            .bind(name).fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("clusterroles.rbac.authorization.k8s.io \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool) -> Result<Vec<ClusterRole>> {
+        let rows = sqlx::query("SELECT uid, name, spec, created_at FROM clusterroles ORDER BY created_at DESC")
+            .fetch_all(pool).await?;
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM clusterroles WHERE name = ?").bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("clusterroles \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> ClusterRole {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut cr: ClusterRole = json_from(&spec);
+        cr.metadata.name = Some(name);
+        cr.metadata.uid = Some(parse_uid(&uid));
+        cr.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        cr
+    }
+}
+
+// ============================================================================
+// ClusterRoleBinding (cluster-scoped)
+// ============================================================================
+
+pub struct ClusterRoleBindingRepository;
+
+impl ClusterRoleBindingRepository {
+    pub async fn create(pool: &AnyPool, b: &ClusterRoleBinding) -> Result<ClusterRoleBinding> {
+        let uid = b.metadata.uid.unwrap_or_else(Uuid::new_v4);
+        let name = b.metadata.name().to_string();
+        let labels = json_str(&b.metadata.labels)?;
+        let annotations = json_str(&b.metadata.annotations)?;
+        let spec = json_str(b)?;
+        let now = now_str();
+        sqlx::query(
+            r#"
+            INSERT INTO clusterrolebindings (uid, name, labels, annotations, spec, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name) DO UPDATE SET
+                labels = EXCLUDED.labels, annotations = EXCLUDED.annotations,
+                spec = EXCLUDED.spec, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(uid.to_string()).bind(&name).bind(&labels).bind(&annotations)
+        .bind(&spec).bind(&now).bind(&now).execute(pool).await?;
+        Self::get(pool, &name).await
+    }
+
+    pub async fn get(pool: &AnyPool, name: &str) -> Result<ClusterRoleBinding> {
+        let row = sqlx::query("SELECT uid, name, spec, created_at FROM clusterrolebindings WHERE name = ?")
+            .bind(name).fetch_optional(pool).await?
+            .ok_or_else(|| Error::NotFound(format!("clusterrolebindings.rbac.authorization.k8s.io \"{}\" not found", name)))?;
+        Ok(Self::row_to(row))
+    }
+
+    pub async fn list(pool: &AnyPool) -> Result<Vec<ClusterRoleBinding>> {
+        let rows = sqlx::query("SELECT uid, name, spec, created_at FROM clusterrolebindings ORDER BY created_at DESC")
+            .fetch_all(pool).await?;
+        Ok(rows.into_iter().map(Self::row_to).collect())
+    }
+
+    pub async fn delete(pool: &AnyPool, name: &str) -> Result<()> {
+        let r = sqlx::query("DELETE FROM clusterrolebindings WHERE name = ?").bind(name).execute(pool).await?;
+        if r.rows_affected() == 0 { return Err(Error::NotFound(format!("clusterrolebindings \"{}\" not found", name))); }
+        Ok(())
+    }
+
+    fn row_to(row: sqlx::any::AnyRow) -> ClusterRoleBinding {
+        let uid: String = row.get("uid");
+        let name: String = row.get("name");
+        let spec: String = row.get("spec");
+        let created_at: String = row.get("created_at");
+        let mut b: ClusterRoleBinding = json_from(&spec);
+        b.metadata.name = Some(name);
+        b.metadata.uid = Some(parse_uid(&uid));
+        b.metadata.creation_timestamp = Some(parse_dt(&created_at));
+        b
+    }
+}
+

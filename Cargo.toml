@@ -1,5 +1,5 @@
 [package]
-name = "kais"
+name = "superkube"
 version = "0.1.0"
 edition = "2021"
 description = "A minimal Kubernetes-like platform in Rust"
@@ -7,7 +7,7 @@ authors = ["System32 AI"]
 license = "MIT"
 
 [[bin]]
-name = "kais"
+name = "superkube"
 path = "src/main.rs"
 
 [dependencies]
@@ -65,6 +65,10 @@ tokio-tungstenite = "0.24"
 
 # Used by the runtime trait's log streaming type.
 bytes = "1"
+
+# Parse repeated query params (`?command=ls&command=-l`) so kubectl exec
+# preserves all argv entries.
+serde_urlencoded = "0.7"
 
 # libcontainer (youki) drives namespaces / cgroups / pivot_root.
 # Linux-only: it pulls in nix, libseccomp, etc. that don't build on macOS.
