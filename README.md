@@ -199,49 +199,6 @@ statefulsets / daemonsets
 
 JSON spec/labels/annotations stored as `TEXT`; UUIDs and timestamps as ISO strings. Migrations run on every server start.
 
-## Project layout
-
-```
-.
-├── Cargo.toml
-├── README.md
-├── docker-compose.yml         # Postgres for testing, optional
-├── migrations/                # *.sql, run on startup
-└── src/
-    ├── main.rs                # CLI entry point
-    ├── lib.rs
-    ├── util.rs                # detect_hostname, etc.
-    ├── error.rs
-    ├── models/                # Kubernetes API types
-    │   ├── pod.rs daemonset.rs deployment.rs statefulset.rs
-    │   ├── service.rs node.rs namespace.rs event.rs
-    │   ├── auth.rs            # SA / Secret / ConfigMap / ClusterRole(Binding)
-    │   ├── affinity.rs        # node + pod (anti-)affinity types
-    │   └── meta.rs            # ObjectMeta, LabelSelector, ...
-    ├── db/                    # sqlx::Any layer — works on Postgres + SQLite
-    │   ├── mod.rs
-    │   └── repository.rs
-    ├── server/                # control plane
-    │   ├── api.rs             # all HTTP handlers
-    │   ├── routes.rs          # axum router
-    │   ├── controller.rs      # reconciliation loops + event recorder
-    │   ├── scheduler.rs       # nodeSelector + node/pod affinity
-    │   ├── table.rs           # kubectl Table response builder
-    │   ├── printers.rs        # column defs per resource kind
-    │   └── mod.rs             # spawns embedded node agent
-    └── node/
-        ├── agent.rs           # heartbeat, pod reconcile, log/exec relay
-        ├── proxy.rs           # NodePort userspace proxy
-        ├── runtime/
-        │   ├── mod.rs         # Runtime trait + selector
-        │   ├── mock.rs        # in-memory stub
-        │   ├── docker.rs      # bollard-backed (macOS + Linux)
-        │   └── embedded.rs    # libcontainer-backed (Linux only)
-        └── oci/               # cross-platform pieces of the embedded path
-            ├── image.rs       # oci-distribution → unpacked rootfs
-            └── bundle.rs      # OCI runtime spec from a Pod container
-```
-
 ## Known caveats
 
 - **`kubectl apply` on existing objects** uses HTTP `PATCH`, which we don't implement yet. First-time apply (PUT/POST) works; re-applying a changed resource currently fails with `MethodNotAllowed`. Workarounds: `kubectl replace -f file.yaml --force`, or `delete` + `apply`.
