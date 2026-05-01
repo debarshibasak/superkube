@@ -134,6 +134,7 @@ fn find_node_for_pod<'a>(
 ) -> anyhow::Result<&'a Node> {
     let node_selector = pod.spec.node_selector.as_ref();
     let affinity = pod.spec.affinity.as_ref();
+    let (pod_cpu_m, pod_mem_b) = sum_pod_requests(pod);
 
     for node in nodes {
         // 1. Node must be Ready.
@@ -190,10 +191,142 @@ fn find_node_for_pod<'a>(
             }
         }
 
+        // 5. Capacity fit: sum requests of pods already bound to this node and
+        //    require allocatable >= used + this pod's requests. Pods/keys with
+        //    no requests count as zero (BestEffort). Missing allocatable on a
+        //    given key is treated as unconstrained for that key.
+        if !node_fits(node, existing_pods, pod_cpu_m, pod_mem_b) {
+            continue;
+        }
+
         return Ok(node);
     }
 
     anyhow::bail!("No suitable node found for pod")
+}
+
+/// Sum of `containers[].resources.requests` for cpu (millicores) and memory
+/// (bytes). Unparseable values are treated as zero so a malformed manifest
+/// cannot wedge scheduling.
+fn sum_pod_requests(pod: &Pod) -> (u64, u64) {
+    let mut cpu_m: u64 = 0;
+    let mut mem_b: u64 = 0;
+    for c in &pod.spec.containers {
+        let Some(reqs) = c.resources.as_ref().and_then(|r| r.requests.as_ref()) else {
+            continue;
+        };
+        if let Some(v) = reqs.get("cpu") {
+            cpu_m = cpu_m.saturating_add(parse_cpu_millicores(v).unwrap_or(0));
+        }
+        if let Some(v) = reqs.get("memory") {
+            mem_b = mem_b.saturating_add(parse_memory_bytes(v).unwrap_or(0));
+        }
+    }
+    (cpu_m, mem_b)
+}
+
+/// Whether `node`'s allocatable cpu/memory can accommodate `pod_cpu_m` /
+/// `pod_mem_b` in addition to the already-bound, non-terminal pods on it.
+fn node_fits(node: &Node, existing_pods: &[Pod], pod_cpu_m: u64, pod_mem_b: u64) -> bool {
+    let node_name = node.metadata.name();
+    let mut used_cpu_m: u64 = 0;
+    let mut used_mem_b: u64 = 0;
+    for p in existing_pods {
+        if p.spec.node_name.as_deref() != Some(node_name) {
+            continue;
+        }
+        // Terminal pods don't consume resources.
+        if let Some(s) = p.status.as_ref() {
+            if matches!(s.phase, PodPhase::Succeeded | PodPhase::Failed) {
+                continue;
+            }
+        }
+        let (c, m) = sum_pod_requests(p);
+        used_cpu_m = used_cpu_m.saturating_add(c);
+        used_mem_b = used_mem_b.saturating_add(m);
+    }
+
+    let allocatable = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
+
+    if pod_cpu_m > 0 {
+        if let Some(alloc_cpu) = allocatable
+            .and_then(|a| a.get("cpu"))
+            .and_then(|s| parse_cpu_millicores(s))
+        {
+            if used_cpu_m.saturating_add(pod_cpu_m) > alloc_cpu {
+                return false;
+            }
+        }
+    }
+    if pod_mem_b > 0 {
+        if let Some(alloc_mem) = allocatable
+            .and_then(|a| a.get("memory"))
+            .and_then(|s| parse_memory_bytes(s))
+        {
+            if used_mem_b.saturating_add(pod_mem_b) > alloc_mem {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Parse a Kubernetes CPU quantity into millicores.
+/// Accepts "100m", "0.5", "2", "1.5". Returns None on malformed input.
+fn parse_cpu_millicores(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix('m') {
+        return num.trim().parse::<u64>().ok();
+    }
+    let cores: f64 = s.parse().ok()?;
+    if cores < 0.0 || !cores.is_finite() {
+        return None;
+    }
+    Some((cores * 1000.0).round() as u64)
+}
+
+/// Parse a Kubernetes memory quantity into bytes.
+/// Binary suffixes (Ki, Mi, Gi, Ti, Pi, Ei) use 1024; decimal suffixes
+/// (k, M, G, T, P, E) use 1000. Plain numbers are bytes.
+fn parse_memory_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num_part, mult) = if let Some(rest) = s.strip_suffix("Ki") {
+        (rest, 1024u128)
+    } else if let Some(rest) = s.strip_suffix("Mi") {
+        (rest, 1024u128.pow(2))
+    } else if let Some(rest) = s.strip_suffix("Gi") {
+        (rest, 1024u128.pow(3))
+    } else if let Some(rest) = s.strip_suffix("Ti") {
+        (rest, 1024u128.pow(4))
+    } else if let Some(rest) = s.strip_suffix("Pi") {
+        (rest, 1024u128.pow(5))
+    } else if let Some(rest) = s.strip_suffix("Ei") {
+        (rest, 1024u128.pow(6))
+    } else if let Some(rest) = s.strip_suffix('k') {
+        (rest, 1_000u128)
+    } else if let Some(rest) = s.strip_suffix('M') {
+        (rest, 1_000_000u128)
+    } else if let Some(rest) = s.strip_suffix('G') {
+        (rest, 1_000_000_000u128)
+    } else if let Some(rest) = s.strip_suffix('T') {
+        (rest, 1_000_000_000_000u128)
+    } else if let Some(rest) = s.strip_suffix('P') {
+        (rest, 1_000_000_000_000_000u128)
+    } else if let Some(rest) = s.strip_suffix('E') {
+        (rest, 1_000_000_000_000_000_000u128)
+    } else {
+        (s, 1u128)
+    };
+
+    let num: f64 = num_part.trim().parse().ok()?;
+    if num < 0.0 || !num.is_finite() {
+        return None;
+    }
+    let bytes = (num * mult as f64).round();
+    if bytes < 0.0 || bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
 }
 
 fn is_node_ready(node: &Node) -> bool {
