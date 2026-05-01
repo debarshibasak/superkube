@@ -54,13 +54,16 @@ impl Ipam {
             .ok_or_else(|| anyhow!("pod CIDR {} /24 exhausted", self.prefix))?;
         state.taken.insert(octet);
         state.by_pod.insert(pod_name.to_string(), octet);
-        Ok(format!("{}.{}", self.prefix, octet).parse().unwrap())
+        let ip: Ipv4Addr = format!("{}.{}", self.prefix, octet).parse().unwrap();
+        tracing::info!("ipam: allocated {} to pod {}", ip, pod_name);
+        Ok(ip)
     }
 
     pub fn release(&self, pod_name: &str) {
         let mut state = self.state.lock().unwrap();
         if let Some(o) = state.by_pod.remove(pod_name) {
             state.taken.remove(&o);
+            tracing::info!("ipam: released {}.{} from pod {}", self.prefix, o, pod_name);
         }
     }
 }

@@ -53,6 +53,10 @@ impl ServiceProxy {
     }
 
     pub async fn run(self: Arc<Self>) {
+        tracing::info!(
+            "service proxy: started (reconcile every {}s)",
+            RECONCILE_INTERVAL_SECS
+        );
         let mut tick = interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
         loop {
             tick.tick().await;

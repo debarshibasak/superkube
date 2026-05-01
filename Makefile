@@ -10,7 +10,7 @@ SHELL := /usr/bin/env bash
 
 BIN              ?= superkube
 TARGET_DIR       ?= target
-DOCKER_IMAGE     ?= superkube
+DOCKER_IMAGE     ?= system32ai/superkube
 DOCKER_TAG       ?= dev
 LINUX_TARGET     ?= x86_64-unknown-linux-gnu
 ARM_LINUX_TARGET ?= aarch64-unknown-linux-gnu
@@ -84,6 +84,31 @@ docker-run: ## run the container (API on host :6443, SQLite volume)
 .PHONY: docker-push
 docker-push: ## push the image (set DOCKER_IMAGE to a registry path first)
 	docker push $(DOCKER_IMAGE):$(DOCKER_TAG)
+
+# ---------------------------------------------------------------------------- #
+# Publish (push to GitHub remote `origin2` + Docker Hub)                       #
+# ---------------------------------------------------------------------------- #
+
+PUBLISH_REMOTE ?= origin2
+PUBLISH_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
+# Tag at HEAD (errors if HEAD is not tagged — set PUBLISH_TAG=... to override)
+PUBLISH_TAG    ?= $(shell git describe --tags --exact-match 2>/dev/null)
+
+.PHONY: publish-git
+publish-git: ## push current branch + $(PUBLISH_TAG) to $(PUBLISH_REMOTE)
+	@[ -n "$(PUBLISH_TAG)" ] || { echo "no git tag at HEAD; tag the commit or pass PUBLISH_TAG=..."; exit 1; }
+	git push $(PUBLISH_REMOTE) $(PUBLISH_BRANCH)
+	git push $(PUBLISH_REMOTE) $(PUBLISH_TAG)
+
+.PHONY: publish-docker
+publish-docker: ## build & push $(DOCKER_IMAGE):$(PUBLISH_TAG) and :latest
+	@[ -n "$(PUBLISH_TAG)" ] || { echo "no git tag at HEAD; tag the commit or pass PUBLISH_TAG=..."; exit 1; }
+	DOCKER_BUILDKIT=1 docker build -t $(DOCKER_IMAGE):$(PUBLISH_TAG) -t $(DOCKER_IMAGE):latest .
+	docker push $(DOCKER_IMAGE):$(PUBLISH_TAG)
+	docker push $(DOCKER_IMAGE):latest
+
+.PHONY: publish
+publish: publish-git publish-docker ## publish $(PUBLISH_TAG) to GitHub ($(PUBLISH_REMOTE)) + Docker Hub
 
 # ---------------------------------------------------------------------------- #
 # System install (systemd on Linux, launchd on macOS)                          #

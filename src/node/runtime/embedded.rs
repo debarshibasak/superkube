@@ -69,6 +69,7 @@ struct ContainerEntry {
 
 impl EmbeddedRuntime {
     pub async fn new() -> anyhow::Result<Self> {
+        tracing::info!("embedded runtime: initializing (state root={})", STATE_ROOT);
         let state_path = PathBuf::from(STATE_ROOT).join("state");
         let image_root = PathBuf::from(STATE_ROOT).join("images");
         let bundle_root = PathBuf::from(STATE_ROOT).join("bundles");
@@ -130,6 +131,11 @@ impl Runtime for EmbeddedRuntime {
         name: &str,
         container: &PodContainer,
     ) -> anyhow::Result<String> {
+        tracing::info!(
+            "embedded: create+start container name={} image={}",
+            name,
+            container.image
+        );
         // 1. Pull image (cached if already on disk).
         let pulled = oci::image::pull(&container.image, &self.image_root).await?;
 

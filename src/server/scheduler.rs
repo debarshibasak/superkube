@@ -25,6 +25,7 @@ impl Scheduler {
     /// Run the scheduler loop. In Postgres mode the lease ensures only one
     /// master at a time picks nodes for pending pods.
     pub async fn run(&self) {
+        tracing::info!("Scheduler started (interval=2s, lease_ttl={:?})", SCHEDULER_LEASE_TTL);
         let mut interval = interval(Duration::from_secs(2));
 
         loop {
@@ -49,9 +50,18 @@ impl Scheduler {
 
         let nodes = NodeRepository::list_ready(&self.pool).await?;
         if nodes.is_empty() {
-            tracing::debug!("No ready nodes available for scheduling");
+            tracing::info!(
+                "Scheduler: {} pending pods but no Ready nodes available",
+                pods.len()
+            );
             return Ok(());
         }
+
+        tracing::info!(
+            "Scheduler: scheduling {} pending pod(s) across {} Ready node(s)",
+            pods.len(),
+            nodes.len()
+        );
 
         // Pre-fetch all currently-bound pods. Pod (anti-)affinity needs to
         // know which node each existing pod ended up on. Cheap because the

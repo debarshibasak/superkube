@@ -171,6 +171,8 @@ impl NodeAgent {
         });
         let _ = proxy_handle;
 
+        tracing::info!("node agent: entering main loop (heartbeat=10s, pod sync=5s)");
+
         // Start heartbeat and pod sync loops
         let mut heartbeat_interval = interval(Duration::from_secs(10));
         let mut sync_interval = interval(Duration::from_secs(5));

@@ -19,6 +19,7 @@ pub async fn ensure_bridge(handle: &Handle, gateway: Ipv4Addr) -> Result<u32> {
         return Ok(idx);
     }
 
+    tracing::info!("network: creating bridge {} gateway={}", BRIDGE_NAME, gateway);
     handle
         .link()
         .add()
@@ -33,6 +34,7 @@ pub async fn ensure_bridge(handle: &Handle, gateway: Ipv4Addr) -> Result<u32> {
 
     ensure_address(handle, idx, gateway, 24).await?;
     ensure_link_up(handle, idx).await?;
+    tracing::info!("network: bridge {} ready (gateway={}, idx={})", BRIDGE_NAME, gateway, idx);
     Ok(idx)
 }
 

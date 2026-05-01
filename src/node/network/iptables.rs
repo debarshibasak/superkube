@@ -14,6 +14,7 @@ use super::BRIDGE_NAME;
 /// Install MASQUERADE for `<pod_cidr>` egress + permissive forwarding from the
 /// bridge. Safe to call repeatedly.
 pub fn ensure_masquerade(pod_cidr: &str) -> Result<()> {
+    tracing::info!("network: ensuring iptables MASQUERADE for pod CIDR {}", pod_cidr);
     install("nat", "POSTROUTING", &[
         "-s", pod_cidr,
         "!", "-o", BRIDGE_NAME,
@@ -39,6 +40,7 @@ fn install(table: &str, chain: &str, rule: &[&str]) -> Result<()> {
             return Ok(());
         }
     }
+    tracing::info!("network: installing iptables -t {} -I {} {:?}", table, chain, rule);
     let mut add = Command::new("iptables");
     add.args(["-t", table, "-I", chain]).args(rule);
     let status = add

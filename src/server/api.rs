@@ -341,8 +341,10 @@ pub async fn create_pod(
 ) -> Result<(StatusCode, Json<Pod>)> {
     // Ensure namespace is set
     if pod.metadata.namespace.is_none() {
-        pod.metadata.namespace = Some(namespace);
+        pod.metadata.namespace = Some(namespace.clone());
     }
+    let pod_name = pod.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create pod {}/{}", namespace, pod_name);
     let created = PodRepository::create(&state.pool, &pod).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -352,6 +354,7 @@ pub async fn update_pod(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut pod): Json<Pod>,
 ) -> Result<Json<Pod>> {
+    tracing::info!("api: update pod {}/{}", namespace, name);
     pod.metadata.namespace = Some(namespace);
     pod.metadata.name = Some(name);
     let updated = PodRepository::create(&state.pool, &pod).await?;
@@ -362,6 +365,7 @@ pub async fn delete_pod(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete pod {}/{}", namespace, name);
     PodRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({
         "apiVersion": "v1",
@@ -389,6 +393,12 @@ pub async fn update_pod_status(
     Json(pod): Json<Pod>,
 ) -> Result<Json<Pod>> {
     if let Some(status) = &pod.status {
+        tracing::info!(
+            "api: update pod status {}/{} phase={:?}",
+            namespace,
+            name,
+            status.phase
+        );
         PodRepository::update_status(&state.pool, &namespace, &name, status).await?;
     }
     let updated = PodRepository::get(&state.pool, &namespace, &name).await?;
@@ -423,6 +433,14 @@ pub async fn get_pod_logs(
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<LogParams>,
 ) -> Result<Response> {
+    tracing::info!(
+        "api: pod logs {}/{} container={:?} follow={} tail={:?}",
+        namespace,
+        name,
+        params.container,
+        params.follow,
+        params.tail_lines
+    );
     // Get the pod to verify it exists and find the node
     let pod = PodRepository::get(&state.pool, &namespace, &name).await?;
 
@@ -632,6 +650,14 @@ pub async fn exec_pod(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let params = ExecParams::from_query(raw_query.0.as_deref().unwrap_or(""));
+    tracing::info!(
+        "api: exec pod {}/{} cmd={:?} tty={} container={:?}",
+        namespace,
+        name,
+        params.command,
+        params.tty,
+        params.container
+    );
     // Get the pod to verify it exists and find the node
     let pod = match PodRepository::get(&state.pool, &namespace, &name).await {
         Ok(p) => p,
@@ -878,6 +904,12 @@ pub async fn port_forward_pod(
     Query(params): Query<PortForwardParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    tracing::info!(
+        "api: port-forward pod {}/{} ports={:?}",
+        namespace,
+        name,
+        params.ports
+    );
     // Get the pod to verify it exists and find the node
     let pod = match PodRepository::get(&state.pool, &namespace, &name).await {
         Ok(p) => p,
@@ -1063,7 +1095,7 @@ pub async fn create_service(
     Json(mut service): Json<Service>,
 ) -> Result<(StatusCode, Json<Service>)> {
     if service.metadata.namespace.is_none() {
-        service.metadata.namespace = Some(namespace);
+        service.metadata.namespace = Some(namespace.clone());
     }
     // Auto-assign ClusterIP for any type that should have one. Per the
     // Kubernetes docs, ClusterIP / NodePort / LoadBalancer all get one;
@@ -1075,6 +1107,14 @@ pub async fn create_service(
         let prefix = service_cidr_prefix(&state.service_cidr);
         service.spec.cluster_ip = Some(format!("{}.{}", prefix, octet));
     }
+    let svc_name = service.metadata.name.clone().unwrap_or_default();
+    tracing::info!(
+        "api: create service {}/{} type={:?} clusterIP={:?}",
+        namespace,
+        svc_name,
+        service.spec.service_type,
+        service.spec.cluster_ip
+    );
     let created = ServiceRepository::create(&state.pool, &service).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1084,6 +1124,7 @@ pub async fn update_service(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut service): Json<Service>,
 ) -> Result<Json<Service>> {
+    tracing::info!("api: update service {}/{}", namespace, name);
     service.metadata.namespace = Some(namespace);
     service.metadata.name = Some(name);
     let updated = ServiceRepository::create(&state.pool, &service).await?;
@@ -1094,6 +1135,7 @@ pub async fn delete_service(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete service {}/{}", namespace, name);
     ServiceRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({
         "apiVersion": "v1",
@@ -1136,6 +1178,10 @@ pub async fn create_node(
     State(state): State<Arc<AppState>>,
     Json(node): Json<Node>,
 ) -> Result<(StatusCode, Json<Node>)> {
+    tracing::info!(
+        "api: register node {}",
+        node.metadata.name.clone().unwrap_or_default()
+    );
     let created = NodeRepository::create(&state.pool, &node).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1145,6 +1191,7 @@ pub async fn update_node(
     Path(name): Path<String>,
     Json(mut node): Json<Node>,
 ) -> Result<Json<Node>> {
+    tracing::info!("api: update node {}", name);
     node.metadata.name = Some(name);
     let updated = NodeRepository::create(&state.pool, &node).await?;
     Ok(Json(updated))
@@ -1154,6 +1201,7 @@ pub async fn delete_node(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete node {}", name);
     NodeRepository::delete(&state.pool, &name).await?;
     Ok(Json(json!({
         "apiVersion": "v1",
@@ -1242,8 +1290,15 @@ pub async fn create_deployment(
     Json(mut deployment): Json<Deployment>,
 ) -> Result<(StatusCode, Json<Deployment>)> {
     if deployment.metadata.namespace.is_none() {
-        deployment.metadata.namespace = Some(namespace);
+        deployment.metadata.namespace = Some(namespace.clone());
     }
+    let dep_name = deployment.metadata.name.clone().unwrap_or_default();
+    tracing::info!(
+        "api: create deployment {}/{} replicas={}",
+        namespace,
+        dep_name,
+        deployment.spec.replicas.unwrap_or(1)
+    );
     let created = DeploymentRepository::create(&state.pool, &deployment).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1253,6 +1308,12 @@ pub async fn update_deployment(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut deployment): Json<Deployment>,
 ) -> Result<Json<Deployment>> {
+    tracing::info!(
+        "api: update deployment {}/{} replicas={}",
+        namespace,
+        name,
+        deployment.spec.replicas.unwrap_or(1)
+    );
     deployment.metadata.namespace = Some(namespace);
     deployment.metadata.name = Some(name);
     let updated = DeploymentRepository::create(&state.pool, &deployment).await?;
@@ -1263,13 +1324,20 @@ pub async fn delete_deployment(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete deployment {}/{}", namespace, name);
     // First delete all pods owned by this deployment
     let deployment = DeploymentRepository::get(&state.pool, &namespace, &name).await?;
     if let Some(selector) = &deployment.spec.selector.match_labels {
         let pods = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await?;
         for pod in pods {
-            if let Some(name) = pod.metadata.name {
-                let _ = PodRepository::delete(&state.pool, &namespace, &name).await;
+            if let Some(pod_name) = pod.metadata.name {
+                tracing::info!(
+                    "api: cascading delete pod {}/{} owned by deployment {}",
+                    namespace,
+                    pod_name,
+                    name
+                );
+                let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
             }
         }
     }
@@ -1325,6 +1393,10 @@ pub async fn create_namespace(
     State(state): State<Arc<AppState>>,
     Json(namespace): Json<Namespace>,
 ) -> Result<(StatusCode, Json<Namespace>)> {
+    tracing::info!(
+        "api: create namespace {}",
+        namespace.metadata.name.clone().unwrap_or_default()
+    );
     let created = NamespaceRepository::create(&state.pool, &namespace).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1334,6 +1406,7 @@ pub async fn update_namespace(
     Path(name): Path<String>,
     Json(mut namespace): Json<Namespace>,
 ) -> Result<Json<Namespace>> {
+    tracing::info!("api: update namespace {}", name);
     namespace.metadata.name = Some(name);
     let updated = NamespaceRepository::create(&state.pool, &namespace).await?;
     Ok(Json(updated))
@@ -1343,6 +1416,7 @@ pub async fn delete_namespace(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete namespace {}", name);
     NamespaceRepository::delete(&state.pool, &name).await?;
     Ok(Json(json!({
         "apiVersion": "v1",
@@ -1466,6 +1540,7 @@ pub async fn delete_event(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete event {}/{}", namespace, name);
     EventRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({
         "apiVersion": "v1",
@@ -1534,8 +1609,14 @@ pub async fn create_statefulset(
     Json(mut ss): Json<StatefulSet>,
 ) -> Result<(StatusCode, Json<StatefulSet>)> {
     if ss.metadata.namespace.is_none() {
-        ss.metadata.namespace = Some(namespace);
+        ss.metadata.namespace = Some(namespace.clone());
     }
+    tracing::info!(
+        "api: create statefulset {}/{} replicas={}",
+        namespace,
+        ss.metadata.name.clone().unwrap_or_default(),
+        ss.spec.replicas.unwrap_or(1)
+    );
     let created = StatefulSetRepository::create(&state.pool, &ss).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1545,6 +1626,12 @@ pub async fn update_statefulset(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut ss): Json<StatefulSet>,
 ) -> Result<Json<StatefulSet>> {
+    tracing::info!(
+        "api: update statefulset {}/{} replicas={}",
+        namespace,
+        name,
+        ss.spec.replicas.unwrap_or(1)
+    );
     ss.metadata.namespace = Some(namespace);
     ss.metadata.name = Some(name);
     Ok(Json(StatefulSetRepository::create(&state.pool, &ss).await?))
@@ -1554,12 +1641,19 @@ pub async fn delete_statefulset(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete statefulset {}/{}", namespace, name);
     // Best-effort: also delete the owned pods.
     if let Ok(ss) = StatefulSetRepository::get(&state.pool, &namespace, &name).await {
         if let Some(selector) = &ss.spec.selector.match_labels {
             if let Ok(pods) = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await {
                 for pod in pods {
                     if let Some(pod_name) = pod.metadata.name {
+                        tracing::info!(
+                            "api: cascading delete pod {}/{} owned by statefulset {}",
+                            namespace,
+                            pod_name,
+                            name
+                        );
                         let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
                     }
                 }
@@ -1628,8 +1722,13 @@ pub async fn create_daemonset(
     Json(mut ds): Json<DaemonSet>,
 ) -> Result<(StatusCode, Json<DaemonSet>)> {
     if ds.metadata.namespace.is_none() {
-        ds.metadata.namespace = Some(namespace);
+        ds.metadata.namespace = Some(namespace.clone());
     }
+    tracing::info!(
+        "api: create daemonset {}/{}",
+        namespace,
+        ds.metadata.name.clone().unwrap_or_default()
+    );
     let created = DaemonSetRepository::create(&state.pool, &ds).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -1639,6 +1738,7 @@ pub async fn update_daemonset(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut ds): Json<DaemonSet>,
 ) -> Result<Json<DaemonSet>> {
+    tracing::info!("api: update daemonset {}/{}", namespace, name);
     ds.metadata.namespace = Some(namespace);
     ds.metadata.name = Some(name);
     Ok(Json(DaemonSetRepository::create(&state.pool, &ds).await?))
@@ -1648,11 +1748,18 @@ pub async fn delete_daemonset(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete daemonset {}/{}", namespace, name);
     if let Ok(ds) = DaemonSetRepository::get(&state.pool, &namespace, &name).await {
         if let Some(selector) = &ds.spec.selector.match_labels {
             if let Ok(pods) = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await {
                 for pod in pods {
                     if let Some(pod_name) = pod.metadata.name {
+                        tracing::info!(
+                            "api: cascading delete pod {}/{} owned by daemonset {}",
+                            namespace,
+                            pod_name,
+                            name
+                        );
                         let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
                     }
                 }
@@ -1707,7 +1814,12 @@ pub async fn create_service_account(
     Path(namespace): Path<String>,
     Json(mut sa): Json<ServiceAccount>,
 ) -> Result<(StatusCode, Json<ServiceAccount>)> {
-    if sa.metadata.namespace.is_none() { sa.metadata.namespace = Some(namespace); }
+    if sa.metadata.namespace.is_none() { sa.metadata.namespace = Some(namespace.clone()); }
+    tracing::info!(
+        "api: create serviceaccount {}/{}",
+        namespace,
+        sa.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(ServiceAccountRepository::create(&state.pool, &sa).await?)))
 }
 
@@ -1716,6 +1828,7 @@ pub async fn update_service_account(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut sa): Json<ServiceAccount>,
 ) -> Result<Json<ServiceAccount>> {
+    tracing::info!("api: update serviceaccount {}/{}", namespace, name);
     sa.metadata.namespace = Some(namespace);
     sa.metadata.name = Some(name);
     Ok(Json(ServiceAccountRepository::create(&state.pool, &sa).await?))
@@ -1725,6 +1838,7 @@ pub async fn delete_service_account(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete serviceaccount {}/{}", namespace, name);
     ServiceAccountRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "kind":"serviceaccounts"}})))
@@ -1767,7 +1881,12 @@ pub async fn create_secret(
     Path(namespace): Path<String>,
     Json(mut s): Json<Secret>,
 ) -> Result<(StatusCode, Json<Secret>)> {
-    if s.metadata.namespace.is_none() { s.metadata.namespace = Some(namespace); }
+    if s.metadata.namespace.is_none() { s.metadata.namespace = Some(namespace.clone()); }
+    tracing::info!(
+        "api: create secret {}/{}",
+        namespace,
+        s.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(SecretRepository::create(&state.pool, &s).await?)))
 }
 
@@ -1776,6 +1895,7 @@ pub async fn update_secret(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut s): Json<Secret>,
 ) -> Result<Json<Secret>> {
+    tracing::info!("api: update secret {}/{}", namespace, name);
     s.metadata.namespace = Some(namespace);
     s.metadata.name = Some(name);
     Ok(Json(SecretRepository::create(&state.pool, &s).await?))
@@ -1785,6 +1905,7 @@ pub async fn delete_secret(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete secret {}/{}", namespace, name);
     SecretRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "kind":"secrets"}})))
@@ -1827,7 +1948,12 @@ pub async fn create_config_map(
     Path(namespace): Path<String>,
     Json(mut cm): Json<ConfigMap>,
 ) -> Result<(StatusCode, Json<ConfigMap>)> {
-    if cm.metadata.namespace.is_none() { cm.metadata.namespace = Some(namespace); }
+    if cm.metadata.namespace.is_none() { cm.metadata.namespace = Some(namespace.clone()); }
+    tracing::info!(
+        "api: create configmap {}/{}",
+        namespace,
+        cm.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(ConfigMapRepository::create(&state.pool, &cm).await?)))
 }
 
@@ -1836,6 +1962,7 @@ pub async fn update_config_map(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut cm): Json<ConfigMap>,
 ) -> Result<Json<ConfigMap>> {
+    tracing::info!("api: update configmap {}/{}", namespace, name);
     cm.metadata.namespace = Some(namespace);
     cm.metadata.name = Some(name);
     Ok(Json(ConfigMapRepository::create(&state.pool, &cm).await?))
@@ -1845,6 +1972,7 @@ pub async fn delete_config_map(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete configmap {}/{}", namespace, name);
     ConfigMapRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "kind":"configmaps"}})))
@@ -1876,6 +2004,10 @@ pub async fn create_cluster_role(
     State(state): State<Arc<AppState>>,
     Json(cr): Json<ClusterRole>,
 ) -> Result<(StatusCode, Json<ClusterRole>)> {
+    tracing::info!(
+        "api: create clusterrole {}",
+        cr.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(ClusterRoleRepository::create(&state.pool, &cr).await?)))
 }
 
@@ -1884,6 +2016,7 @@ pub async fn update_cluster_role(
     Path(name): Path<String>,
     Json(mut cr): Json<ClusterRole>,
 ) -> Result<Json<ClusterRole>> {
+    tracing::info!("api: update clusterrole {}", name);
     cr.metadata.name = Some(name);
     Ok(Json(ClusterRoleRepository::create(&state.pool, &cr).await?))
 }
@@ -1892,6 +2025,7 @@ pub async fn delete_cluster_role(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete clusterrole {}", name);
     ClusterRoleRepository::delete(&state.pool, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"clusterroles"}})))
@@ -1923,6 +2057,10 @@ pub async fn create_cluster_role_binding(
     State(state): State<Arc<AppState>>,
     Json(b): Json<ClusterRoleBinding>,
 ) -> Result<(StatusCode, Json<ClusterRoleBinding>)> {
+    tracing::info!(
+        "api: create clusterrolebinding {}",
+        b.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(ClusterRoleBindingRepository::create(&state.pool, &b).await?)))
 }
 
@@ -1931,6 +2069,7 @@ pub async fn update_cluster_role_binding(
     Path(name): Path<String>,
     Json(mut b): Json<ClusterRoleBinding>,
 ) -> Result<Json<ClusterRoleBinding>> {
+    tracing::info!("api: update clusterrolebinding {}", name);
     b.metadata.name = Some(name);
     Ok(Json(ClusterRoleBindingRepository::create(&state.pool, &b).await?))
 }
@@ -1939,6 +2078,7 @@ pub async fn delete_cluster_role_binding(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete clusterrolebinding {}", name);
     ClusterRoleBindingRepository::delete(&state.pool, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"clusterrolebindings"}})))
@@ -2089,7 +2229,12 @@ pub async fn create_role(
     Path(namespace): Path<String>,
     Json(mut r): Json<Role>,
 ) -> Result<(StatusCode, Json<Role>)> {
-    if r.metadata.namespace.is_none() { r.metadata.namespace = Some(namespace); }
+    if r.metadata.namespace.is_none() { r.metadata.namespace = Some(namespace.clone()); }
+    tracing::info!(
+        "api: create role {}/{}",
+        namespace,
+        r.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(RoleRepository::create(&state.pool, &r).await?)))
 }
 
@@ -2098,6 +2243,7 @@ pub async fn update_role(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut r): Json<Role>,
 ) -> Result<Json<Role>> {
+    tracing::info!("api: update role {}/{}", namespace, name);
     r.metadata.namespace = Some(namespace);
     r.metadata.name = Some(name);
     Ok(Json(RoleRepository::create(&state.pool, &r).await?))
@@ -2107,6 +2253,7 @@ pub async fn delete_role(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete role {}/{}", namespace, name);
     RoleRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"roles"}})))
@@ -2153,7 +2300,12 @@ pub async fn create_role_binding(
     Path(namespace): Path<String>,
     Json(mut b): Json<RoleBinding>,
 ) -> Result<(StatusCode, Json<RoleBinding>)> {
-    if b.metadata.namespace.is_none() { b.metadata.namespace = Some(namespace); }
+    if b.metadata.namespace.is_none() { b.metadata.namespace = Some(namespace.clone()); }
+    tracing::info!(
+        "api: create rolebinding {}/{}",
+        namespace,
+        b.metadata.name.clone().unwrap_or_default()
+    );
     Ok((StatusCode::CREATED, Json(RoleBindingRepository::create(&state.pool, &b).await?)))
 }
 
@@ -2162,6 +2314,7 @@ pub async fn update_role_binding(
     Path((namespace, name)): Path<(String, String)>,
     Json(mut b): Json<RoleBinding>,
 ) -> Result<Json<RoleBinding>> {
+    tracing::info!("api: update rolebinding {}/{}", namespace, name);
     b.metadata.namespace = Some(namespace);
     b.metadata.name = Some(name);
     Ok(Json(RoleBindingRepository::create(&state.pool, &b).await?))
@@ -2171,6 +2324,7 @@ pub async fn delete_role_binding(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
+    tracing::info!("api: delete rolebinding {}/{}", namespace, name);
     RoleBindingRepository::delete(&state.pool, &namespace, &name).await?;
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"rolebindings"}})))

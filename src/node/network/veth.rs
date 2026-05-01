@@ -35,6 +35,12 @@ pub async fn setup_pod_network(
     pod_ip: Ipv4Addr,
     gateway: Ipv4Addr,
 ) -> Result<PodNetwork> {
+    tracing::info!(
+        "network: setting up pod network pod={} ip={} gateway={}",
+        pod_name,
+        pod_ip,
+        gateway
+    );
     // Persistent netns at /var/run/netns/<pod_name>. NetworkNamespace::add
     // creates and bind-mounts it for us.
     NetworkNamespace::add(pod_name.to_string())
@@ -127,6 +133,11 @@ pub async fn setup_pod_network(
 /// not propagated — by the time we tear down, the netns or veth may already be
 /// gone (e.g. the kernel reaped them when the container init exited).
 pub async fn teardown_pod_network(net: PodNetwork) {
+    tracing::info!(
+        "network: tearing down pod network pod={} ip={}",
+        net.pod_name,
+        net.pod_ip
+    );
     let (conn, handle, _) = match rtnetlink::new_connection() {
         Ok(c) => c,
         Err(e) => {
