@@ -1,0 +1,12 @@
+# Single source of truth for the Rust toolchain.
+#
+# rustup auto-installs this channel on first invocation of `cargo` / `rustc`
+# inside the repo, so contributors don't need to track MSRV bumps by hand.
+# Keep `Dockerfile`'s ARG RUST_VERSION in sync with `channel` below — the
+# Dockerfile's `FROM rust:<ver>` doesn't read this file directly, and a
+# mismatch costs an extra rustup-download step on every container build.
+
+[toolchain]
+channel    = "1.88"
+profile    = "minimal"
+components = ["rustfmt", "clippy"]

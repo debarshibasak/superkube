@@ -150,17 +150,14 @@ fn configure_inside_netns(
     pod_ip: Ipv4Addr,
     gateway: Ipv4Addr,
 ) -> Result<()> {
-    use std::os::fd::AsRawFd;
     let netns_fd = std::fs::File::open(netns_path)
         .with_context(|| format!("opening netns {}", netns_path.display()))?;
 
     // Switch this thread into the pod netns. From here on, all socket / netlink
-    // operations apply to that namespace.
-    setns(netns_fd.as_raw_fd(), CloneFlags::CLONE_NEWNET)
+    // operations apply to that namespace. nix ≥0.29 takes `AsFd` here, so the
+    // File is borrowed for the duration of the call and dropped at end of scope.
+    setns(&netns_fd, CloneFlags::CLONE_NEWNET)
         .with_context(|| format!("setns into {pod_name}"))?;
-    // The fd must remain open at least until setns returns, but we can drop the
-    // File now — keeping its raw fd alive is the syscall's responsibility.
-    drop(netns_fd);
 
     // Spin up a per-task rtnetlink runtime tied to *this* (now switched) thread.
     let rt = tokio::runtime::Builder::new_current_thread()

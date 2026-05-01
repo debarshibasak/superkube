@@ -1,0 +1,14 @@
+target/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.git/
+.github/
+.idea/
+.vscode/
+deploy/
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore

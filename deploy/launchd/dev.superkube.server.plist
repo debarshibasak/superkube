@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Install:
+    sudo cp deploy/launchd/dev.superkube.server.plist /Library/LaunchDaemons/
+    sudo chown root:wheel /Library/LaunchDaemons/dev.superkube.server.plist
+    sudo chmod 644       /Library/LaunchDaemons/dev.superkube.server.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/dev.superkube.server.plist
+    sudo launchctl enable  system/dev.superkube.server
+    sudo launchctl kickstart -k system/dev.superkube.server
+
+  Logs:
+    tail -f /var/log/superkube/server.log /var/log/superkube/server.err
+
+  Uninstall:
+    sudo launchctl bootout system /Library/LaunchDaemons/dev.superkube.server.plist
+    sudo rm /Library/LaunchDaemons/dev.superkube.server.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.superkube.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/superkube</string>
+        <string>server</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/superkube</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_URL</key>
+        <string>sqlite:///usr/local/var/superkube/superkube.db</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/superkube/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/superkube/server.err</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

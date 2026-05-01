@@ -1,0 +1,46 @@
+# Install:
+#   sudo cp deploy/systemd/superkube-node.service /etc/systemd/system/
+#   sudo cp deploy/systemd/superkube.env.example /etc/superkube/superkube.env
+#   # edit /etc/superkube/superkube.env and set SUPERKUBE_SERVER=http://<host>:6443
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now superkube-node.service
+
+[Unit]
+Description=Superkube node agent
+Documentation=https://github.com/system32-ai/kais
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=superkube
+Group=superkube
+# Docker runtime path; harmless when --runtime=embedded is selected.
+SupplementaryGroups=docker
+
+WorkingDirectory=/var/lib/superkube
+EnvironmentFile=/etc/superkube/superkube.env
+# SUPERKUBE_SERVER, SUPERKUBE_NODE_NAME, SUPERKUBE_RUNTIME come from the env file.
+# --name defaults to `hostname -s` if SUPERKUBE_NODE_NAME is empty.
+ExecStart=/usr/local/bin/superkube node \
+    --server ${SUPERKUBE_SERVER} \
+    --runtime ${SUPERKUBE_RUNTIME}
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/superkube /var/log/superkube
+
+[Install]
+WantedBy=multi-user.target

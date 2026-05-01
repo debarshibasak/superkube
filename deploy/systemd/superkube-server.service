@@ -1,0 +1,47 @@
+# Install:
+#   sudo cp deploy/systemd/superkube-server.service /etc/systemd/system/
+#   sudo cp deploy/systemd/superkube.env.example   /etc/superkube/superkube.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now superkube-server.service
+
+[Unit]
+Description=Superkube control plane (API server + embedded node agent)
+Documentation=https://github.com/system32-ai/kais
+After=network-online.target docker.service
+Wants=network-online.target
+# docker.service is "Wants" not "Requires" so the unit still starts on hosts
+# using containerd / podman / no daemon — superkube tolerates that at startup
+# and only needs Docker once a pod actually has to run.
+Wants=docker.service
+
+[Service]
+Type=simple
+User=superkube
+Group=superkube
+# Needed so the embedded node agent can read /var/run/docker.sock without root.
+SupplementaryGroups=docker
+
+WorkingDirectory=/var/lib/superkube
+EnvironmentFile=-/etc/superkube/superkube.env
+ExecStart=/usr/local/bin/superkube server
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# Hardening — keep the blast radius small without breaking docker.sock access
+# or the SQLite data dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/superkube /var/log/superkube
+
+[Install]
+WantedBy=multi-user.target
