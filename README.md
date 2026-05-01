@@ -6,6 +6,11 @@ PS: I am working towards making this platform production grade.
 
 `superkube server` boots the API server **and** registers the host as a node — one process, one binary, real containers running through Docker (macOS) or libcontainer (Linux), accessible from real `kubectl`.
 
+<img width="1502" height="776" alt="Screenshot 2026-05-01 at 16 54 50" src="https://github.com/user-attachments/assets/5ccf7058-1635-4116-aec3-9f95e377fec6" />
+
+<img width="1512" height="982" alt="Screenshot 2026-05-01 at 16 55 27" src="https://github.com/user-attachments/assets/2240ee86-eb9c-47fc-b0e5-b11b39685fb1" />
+
+
 ## What works
 
 - **kubectl-shaped API**: discovery, table responses, `cluster-info`, `get all`, `describe`, `logs -f`, `exec`, `port-forward`.
