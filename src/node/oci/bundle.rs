@@ -24,13 +24,23 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use oci_spec::runtime::{
-    LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder, ProcessBuilder,
-    RootBuilder, Spec, SpecBuilder, UserBuilder,
+    LinuxBuilder, LinuxIdMappingBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder,
+    ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
 
 use crate::models::Container;
 
 use super::image::ImageConfig;
+
+/// Host-side identity used to populate uid/gid mappings when the spec needs
+/// a user namespace. Set when kais runs as a non-root user, or already inside
+/// a user namespace — see libcontainer's `rootless_required` for the rule we
+/// mirror.
+#[derive(Clone, Copy, Debug)]
+pub struct RootlessConfig {
+    pub host_uid: u32,
+    pub host_gid: u32,
+}
 
 /// Inputs needed to build a bundle for one container in a pod.
 pub struct BundleInputs<'a> {
@@ -47,6 +57,10 @@ pub struct BundleInputs<'a> {
     /// joins this existing netns (set up by our mini-CNI) instead of creating
     /// a fresh one. Convention: `/var/run/netns/<pod_name>`.
     pub netns_path: Option<&'a str>,
+    /// When `Some`, the spec is built with a user namespace + uid/gid
+    /// mappings so libcontainer accepts it on hosts where rootless is
+    /// required (non-root euid, or already inside a userns).
+    pub rootless: Option<RootlessConfig>,
 }
 
 /// Generate an OCI runtime spec and write it to `<bundle_dir>/config.json`.
@@ -82,8 +96,26 @@ pub fn build_spec(inputs: &BundleInputs<'_>) -> Result<Spec> {
         .build()
         .context("building OCI root")?;
 
-    let linux = LinuxBuilder::default()
-        .namespaces(default_namespaces(inputs.netns_path)?)
+    let mut linux_builder = LinuxBuilder::default()
+        .namespaces(default_namespaces(inputs.netns_path, inputs.rootless.is_some())?);
+
+    if let Some(rc) = inputs.rootless {
+        linux_builder = linux_builder
+            .uid_mappings(vec![LinuxIdMappingBuilder::default()
+                .container_id(0u32)
+                .host_id(rc.host_uid)
+                .size(1u32)
+                .build()
+                .context("building uid mapping")?])
+            .gid_mappings(vec![LinuxIdMappingBuilder::default()
+                .container_id(0u32)
+                .host_id(rc.host_gid)
+                .size(1u32)
+                .build()
+                .context("building gid mapping")?]);
+    }
+
+    let linux = linux_builder
         .build()
         .context("building OCI linux section")?;
 
@@ -92,7 +124,7 @@ pub fn build_spec(inputs: &BundleInputs<'_>) -> Result<Spec> {
         .hostname(inputs.hostname.to_string())
         .process(process)
         .root(root)
-        .mounts(default_mounts()?)
+        .mounts(default_mounts(inputs.rootless.is_some())?)
         .linux(linux)
         .build()
         .context("building OCI spec")?;
@@ -173,6 +205,7 @@ fn parse_user(s: Option<&str>) -> (u32, u32) {
 
 fn default_namespaces(
     netns_path: Option<&str>,
+    rootless: bool,
 ) -> Result<Vec<oci_spec::runtime::LinuxNamespace>> {
     let mut out = Vec::new();
     for kind in [
@@ -201,11 +234,23 @@ fn default_namespaces(
     }
     .context("building network namespace")?;
     out.push(net_ns);
+    if rootless {
+        out.push(
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::User)
+                .build()
+                .context("building user namespace")?,
+        );
+    }
     Ok(out)
 }
 
 /// The standard set of mounts every OCI container expects.
-fn default_mounts() -> Result<Vec<oci_spec::runtime::Mount>> {
+///
+/// Under rootless we drop mount options that reference IDs outside our 1-row
+/// uid/gid map (libcontainer rejects those at validate time — see
+/// `validate_mounts_for_new_user_ns` in libcontainer's `user_ns.rs`).
+fn default_mounts(rootless: bool) -> Result<Vec<oci_spec::runtime::Mount>> {
     let mut mounts = Vec::new();
 
     mounts.push(
@@ -232,19 +277,22 @@ fn default_mounts() -> Result<Vec<oci_spec::runtime::Mount>> {
             .context("mount /dev")?,
     );
 
+    let mut devpts_opts = vec![
+        "nosuid".to_string(),
+        "noexec".to_string(),
+        "newinstance".to_string(),
+        "ptmxmode=0666".to_string(),
+        "mode=0620".to_string(),
+    ];
+    if !rootless {
+        devpts_opts.push("gid=5".to_string());
+    }
     mounts.push(
         MountBuilder::default()
             .destination("/dev/pts")
             .typ("devpts")
             .source("devpts")
-            .options(vec![
-                "nosuid".to_string(),
-                "noexec".to_string(),
-                "newinstance".to_string(),
-                "ptmxmode=0666".to_string(),
-                "mode=0620".to_string(),
-                "gid=5".to_string(),
-            ])
+            .options(devpts_opts)
             .build()
             .context("mount /dev/pts")?,
     );
@@ -360,10 +408,68 @@ mod tests {
             container: &c,
             image: &img(),
             netns_path: None,
+            rootless: None,
         };
         let spec = build_spec(&inputs).unwrap();
         assert_eq!(spec.hostname().as_deref(), Some("demo"));
         let p = spec.process().as_ref().unwrap();
         assert!(p.args().as_ref().unwrap().contains(&"nginx".to_string()));
+        let linux = spec.linux().as_ref().unwrap();
+        assert!(linux.uid_mappings().is_none());
+        assert!(linux
+            .namespaces()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|n| n.typ() != LinuxNamespaceType::User));
+    }
+
+    #[test]
+    fn rootless_emits_user_ns_and_mappings() {
+        let c = container("c", "nginx");
+        let inputs = BundleInputs {
+            hostname: "demo",
+            rootfs_path: "rootfs",
+            container: &c,
+            image: &img(),
+            netns_path: None,
+            rootless: Some(RootlessConfig {
+                host_uid: 1000,
+                host_gid: 1000,
+            }),
+        };
+        let spec = build_spec(&inputs).unwrap();
+        let linux = spec.linux().as_ref().unwrap();
+
+        let has_user_ns = linux
+            .namespaces()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|n| n.typ() == LinuxNamespaceType::User);
+        assert!(has_user_ns, "rootless must declare a user namespace");
+
+        let uid_maps = linux.uid_mappings().as_ref().expect("uid mappings");
+        assert_eq!(uid_maps.len(), 1);
+        assert_eq!(uid_maps[0].container_id(), 0);
+        assert_eq!(uid_maps[0].host_id(), 1000);
+        assert_eq!(uid_maps[0].size(), 1);
+
+        let devpts = spec
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.destination() == std::path::Path::new("/dev/pts"))
+            .unwrap();
+        assert!(
+            devpts
+                .options()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|o| !o.starts_with("gid=")),
+            "rootless devpts must not pin gid= to an unmapped id"
+        );
     }
 }

@@ -69,11 +69,20 @@ bytes = "1"
 # Parse repeated query params (`?command=ls&command=-l`) so kubectl exec
 # preserves all argv entries.
 serde_urlencoded = "0.7"
+# Pinned to a major that still builds on rustc 1.88; bump together with
+# the workspace MSRV. wasmtime ≥ 41 requires rustc ≥ 1.91+.
+wasmtime = { version = "33", features = ["async"] }
+wasmtime-wasi = "33"
+tokio-util = { version = "0.7.18", features = ["io"] }
 
 # libcontainer (youki) drives namespaces / cgroups / pivot_root.
 # Linux-only: it pulls in nix, libseccomp, etc. that don't build on macOS.
 [target.'cfg(target_os = "linux")'.dependencies]
-libcontainer = { version = "0.5", default-features = false, features = ["v2"] }
+# `systemd` is required whenever we run with a user namespace: libcontainer
+# 0.5.7 forces the systemd cgroup driver in that case
+# (`builder_impl.rs:91: systemd_cgroup: use_systemd || user_ns_config.is_some()`)
+# and the code path is only available behind this feature.
+libcontainer = { version = "0.5", default-features = false, features = ["v2", "systemd"] }
 # Built-in mini-CNI: bridge + veth + IP setup via netlink, no host plugins.
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"

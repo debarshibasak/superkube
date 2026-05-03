@@ -37,6 +37,8 @@ pub async fn run(
     port: u16,
     pod_cidr: &str,
     service_cidr: &str,
+    containerd_socket: &str,
+    runtime: &str,
 ) -> anyhow::Result<()> {
     // Create database pool
     tracing::info!("Connecting to database...");
@@ -96,14 +98,24 @@ pub async fn run(
     // This is what makes a single `superkube server` invocation a complete cluster.
     // The agent connects back to ourselves via 127.0.0.1 so we don't depend on
     // resolvable DNS for the bind host.
-    spawn_embedded_node(port, pod_cidr.to_string());
+    spawn_embedded_node(
+        port,
+        pod_cidr.to_string(),
+        containerd_socket.to_string(),
+        runtime.to_string(),
+    );
 
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-fn spawn_embedded_node(port: u16, pod_cidr: String) {
+fn spawn_embedded_node(
+    port: u16,
+    pod_cidr: String,
+    containerd_socket: String,
+    runtime: String,
+) {
     let node_name = crate::util::detect_hostname();
     let server_url = format!("http://127.0.0.1:{}", port);
 
@@ -120,13 +132,19 @@ fn spawn_embedded_node(port: u16, pod_cidr: String) {
         // Tiny delay to let the API listener accept connections before the
         // agent's first registration POST.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        tracing::info!("starting embedded node agent ({})", node_name);
-        if let Err(e) = crate::node::run_with_pod_cidr(
+        tracing::info!(
+            "starting embedded node agent ({}, runtime={}, socket={})",
+            node_name,
+            runtime,
+            containerd_socket
+        );
+        if let Err(e) = crate::node::run_full(
             &node_name,
             &server_url,
-            "/run/containerd/containerd.sock",
+            &containerd_socket,
             labels,
             &pod_cidr,
+            &runtime,
         )
         .await
         {

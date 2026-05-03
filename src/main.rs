@@ -44,6 +44,17 @@ enum Commands {
         /// auto-assign ClusterIPs to ClusterIP-typed services.
         #[arg(long, default_value = "10.96.0.0/12")]
         service_cidr: String,
+
+        /// Path to the container runtime socket used by the embedded node
+        /// agent. Only consulted by the `mock` (and `docker`) runtimes —
+        /// the `embedded` runtime ignores it.
+        #[arg(long, default_value = "/run/containerd/containerd.sock")]
+        containerd_socket: String,
+
+        /// Container runtime backend used by the embedded node agent.
+        /// One of: `auto` (default), `docker`, `embedded`, `mock`, `wasm`.
+        #[arg(long, default_value = "auto")]
+        runtime: String,
     },
 
     /// Start a node agent
@@ -61,7 +72,7 @@ enum Commands {
         containerd_socket: String,
 
         /// Container runtime backend. One of:
-        ///   `auto` (default), `docker`, `embedded`, `mock`.
+        ///   `auto` (default), `docker`, `embedded`, `mock`, `wasm`.
         #[arg(long, default_value = "auto")]
         runtime: String,
     },
@@ -87,9 +98,20 @@ async fn main() -> anyhow::Result<()> {
             host,
             pod_cidr,
             service_cidr,
+            containerd_socket,
+            runtime,
         } => {
             tracing::info!("Starting superkube server on {}:{}", host, port);
-            server::run(&db_url, &host, port, &pod_cidr, &service_cidr).await?;
+            server::run(
+                &db_url,
+                &host,
+                port,
+                &pod_cidr,
+                &service_cidr,
+                &containerd_socket,
+                &runtime,
+            )
+            .await?;
         }
         Commands::Node {
             name,

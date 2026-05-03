@@ -38,6 +38,7 @@ use tokio::sync::Mutex;
 use crate::models::Container as PodContainer;
 use crate::node::network;
 use crate::node::oci;
+use crate::node::oci::bundle::RootlessConfig;
 
 use super::{ContainerInfo, ExecSession, LogOptions, LogStream, PortMapping, Runtime};
 
@@ -57,6 +58,9 @@ pub struct EmbeddedRuntime {
     bundle_root: PathBuf,
     containers: Arc<Mutex<HashMap<String, ContainerEntry>>>,
     ipam: Arc<network::Ipam>,
+    /// Set when libcontainer would otherwise reject the bundle with
+    /// `NoUserNamespace` — non-root euid, or already inside a user namespace.
+    rootless: Option<RootlessConfig>,
 }
 
 struct ContainerEntry {
@@ -95,17 +99,45 @@ impl EmbeddedRuntime {
             tracing::warn!("embedded: host network setup failed ({e}); pods will lack connectivity");
         }
 
+        let rootless = detect_rootless();
+        if let Some(rc) = rootless {
+            tracing::info!(
+                "embedded runtime: rootless mode (host uid={}, gid={}); user namespace + 1:1 mapping will be added to each bundle",
+                rc.host_uid,
+                rc.host_gid
+            );
+        }
+
         Ok(Self {
             state_path,
             image_root,
             bundle_root,
             containers: Arc::new(Mutex::new(HashMap::new())),
             ipam,
+            rootless,
         })
     }
 
     fn strip(id: &str) -> &str {
         id.strip_prefix(ID_PREFIX).unwrap_or(id)
+    }
+}
+
+/// Mirrors libcontainer's `rootless_required` (utils.rs:233) — rootless is
+/// required when the effective uid isn't root, or when we're already inside a
+/// new user namespace (i.e. /proc/self/uid_map doesn't span the full u32).
+fn detect_rootless() -> Option<RootlessConfig> {
+    let euid = nix::unistd::geteuid().as_raw();
+    let in_userns = std::fs::read_to_string("/proc/self/uid_map")
+        .map(|s| !s.contains("4294967295"))
+        .unwrap_or(false);
+    if euid != 0 || in_userns {
+        Some(RootlessConfig {
+            host_uid: euid,
+            host_gid: nix::unistd::getegid().as_raw(),
+        })
+    } else {
+        None
     }
 }
 
@@ -174,6 +206,7 @@ impl Runtime for EmbeddedRuntime {
                 container,
                 image: &pulled.config,
                 netns_path: netns_path.as_deref(),
+                rootless: self.rootless,
             },
         )?;
 
@@ -181,6 +214,27 @@ impl Runtime for EmbeddedRuntime {
         // across libcontainer releases; the call below targets the 0.5 series.
         // We `spawn_blocking` because libcontainer does synchronous
         // pivot_root / clone3 work that we don't want on the tokio runtime.
+        //
+        // Clean up any state dir left over from a previous failed run for
+        // the same name — libcontainer rejects the bundle with `Exist` if
+        // `<state_path>/<name>` already exists. Our in-memory `containers`
+        // map didn't have this name (we just allocated it) so nothing live
+        // owns the directory.
+        let stale_state = self.state_path.join(name);
+        if stale_state.exists() {
+            tracing::warn!(
+                "embedded: removing stale libcontainer state at {} from a prior failed run",
+                stale_state.display()
+            );
+            if let Err(e) = std::fs::remove_dir_all(&stale_state) {
+                tracing::warn!(
+                    "embedded: failed to remove {}: {}; container start will likely fail with Exist",
+                    stale_state.display(),
+                    e
+                );
+            }
+        }
+
         let bundle_owned = bundle_dir.clone();
         let state_owned = self.state_path.clone();
         let name_owned = name.to_string();

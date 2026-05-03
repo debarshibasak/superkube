@@ -21,6 +21,7 @@ use tokio::io::AsyncWrite;
 use crate::models::Container;
 
 mod mock;
+mod wasm;
 #[cfg(target_os = "macos")]
 mod docker;
 #[cfg(target_os = "linux")]
@@ -181,7 +182,15 @@ pub async fn select(
             tracing::info!("using mock runtime");
             Ok(Box::new(r))
         }
-        other => anyhow::bail!("unknown --runtime: {} (expected auto/docker/embedded/mock)", other),
+        "wasm" => {
+            let r = wasm::WasmRuntime::new().await?;
+            tracing::info!("using wasm (wasmtime) runtime");
+            Ok(Box::new(r))
+        }
+        other => anyhow::bail!(
+            "unknown --runtime: {} (expected auto/docker/embedded/mock/wasm)",
+            other
+        ),
     }
 }
 

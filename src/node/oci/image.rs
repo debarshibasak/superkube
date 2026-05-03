@@ -220,6 +220,146 @@ fn string_array(v: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// OCI artifact media types we recognize as "this layer is a raw `.wasm`
+/// module, not a tarball". Different tools have shipped different vendor
+/// strings over the years; we accept the union.
+const WASM_LAYER_MEDIA_TYPES: &[&str] = &[
+    "application/vnd.wasm.content.layer.v1+wasm",
+    "application/vnd.module.wasm.content.layer.v1+wasm",
+    "application/wasm",
+];
+
+/// Pull a WASM module by OCI reference and return the path to a single
+/// `.wasm` file on disk.
+///
+/// Two strategies, tried in order:
+///
+/// 1. **Wasm artifact pull.** If any layer in the manifest carries a wasm
+///    media type, write the first such layer raw to `<dest>/module.wasm`.
+/// 2. **Regular OCI image fallback.** Extract tar layers as in [`pull`],
+///    then look for a `.wasm` file in the resulting rootfs (preferring
+///    `main.wasm` / `app.wasm` / `module.wasm` / `index.wasm`, otherwise
+///    the first one we find).
+///
+/// Local references — `file://`, `wasm://`, or an absolute path — are
+/// treated as already-resolved and returned as-is, which lets the wasm
+/// runtime accept both registry refs and local paths.
+pub async fn pull_wasm(reference: &str, dest_root: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(p) = reference.strip_prefix("file://") {
+        return Ok(PathBuf::from(p));
+    }
+    if let Some(p) = reference.strip_prefix("wasm://") {
+        return Ok(PathBuf::from(p));
+    }
+    if reference.starts_with('/') {
+        return Ok(PathBuf::from(reference));
+    }
+
+    let parsed: Reference = reference
+        .parse()
+        .with_context(|| format!("invalid wasm image reference: {reference}"))?;
+
+    let safe = sanitize(&parsed.whole());
+    let dir = dest_root.join(&safe);
+    let module = dir.join("module.wasm");
+    let sentinel = dir.join(".pulled-wasm");
+
+    if sentinel.exists() && module.exists() {
+        return Ok(module);
+    }
+
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    std::fs::create_dir_all(&dir)?;
+
+    let client = Client::default();
+    let auth = RegistryAuth::Anonymous;
+    let mut accepted: Vec<&str> = WASM_LAYER_MEDIA_TYPES.to_vec();
+    accepted.extend([
+        IMAGE_LAYER_MEDIA_TYPE,
+        IMAGE_LAYER_GZIP_MEDIA_TYPE,
+        IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+    ]);
+
+    tracing::info!("pulling wasm artifact {}", parsed);
+    let image = client
+        .pull(&parsed, &auth, accepted)
+        .await
+        .with_context(|| format!("pulling {parsed}"))?;
+
+    // Strategy 1: a layer is a raw wasm module.
+    if let Some(layer) = image
+        .layers
+        .iter()
+        .find(|l| WASM_LAYER_MEDIA_TYPES.contains(&l.media_type.as_str()))
+    {
+        std::fs::write(&module, &layer.data)
+            .with_context(|| format!("writing wasm layer to {}", module.display()))?;
+        std::fs::write(&sentinel, b"")?;
+        tracing::info!(
+            "pulled wasm artifact {} → {} ({} bytes)",
+            parsed,
+            module.display(),
+            layer.data.len()
+        );
+        return Ok(module);
+    }
+
+    // Strategy 2: regular OCI tar layers; extract and search.
+    let rootfs = dir.join("rootfs");
+    std::fs::create_dir_all(&rootfs)?;
+    for layer in &image.layers {
+        if is_gzip_media_type(&layer.media_type) {
+            let decoder = GzDecoder::new(layer.data.as_slice());
+            extract_tar(decoder, &rootfs)?;
+        } else if layer.media_type == IMAGE_LAYER_MEDIA_TYPE {
+            extract_tar(layer.data.as_slice(), &rootfs)?;
+        }
+    }
+    let found = find_wasm_in(&rootfs)?
+        .ok_or_else(|| anyhow!("no .wasm file found in image {} layers", parsed))?;
+    std::fs::copy(&found, &module).with_context(|| {
+        format!(
+            "copying {} → {}",
+            found.display(),
+            module.display()
+        )
+    })?;
+    // Best-effort cleanup of the rootfs once we've extracted what we wanted.
+    std::fs::remove_dir_all(&rootfs).ok();
+    std::fs::write(&sentinel, b"")?;
+    tracing::info!("pulled OCI image {} → {} (extracted)", parsed, module.display());
+    Ok(module)
+}
+
+fn find_wasm_in(root: &Path) -> anyhow::Result<Option<PathBuf>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let e = entry?;
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out)?;
+            } else if p.extension().and_then(|x| x.to_str()) == Some("wasm") {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    let mut found = Vec::new();
+    walk(root, &mut found)?;
+    let preferred = ["main.wasm", "app.wasm", "module.wasm", "index.wasm"];
+    for name in preferred {
+        if let Some(p) = found
+            .iter()
+            .find(|p| p.file_name().and_then(|s| s.to_str()) == Some(name))
+        {
+            return Ok(Some(p.clone()));
+        }
+    }
+    Ok(found.into_iter().next())
+}
+
 /// Map an image reference to a filesystem-safe directory name.
 fn sanitize(s: &str) -> String {
     s.chars()

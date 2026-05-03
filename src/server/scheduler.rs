@@ -10,6 +10,7 @@ use super::controller;
 pub struct Scheduler {
     pool: AnyPool,
     leases: LeaseManager,
+    strategy: ScoringStrategy,
 }
 
 /// Scheduler lease TTL. Multi-master setups must guarantee only one
@@ -17,9 +18,43 @@ pub struct Scheduler {
 /// nodes for the same pod would race on `pods.node_name`.
 const SCHEDULER_LEASE_TTL: Duration = Duration::from_secs(30);
 
+/// How surviving candidates are ranked once the predicate phase has
+/// produced more than one viable node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScoringStrategy {
+    /// Prefer the node with the most free cpu+memory headroom — spreads load.
+    #[default]
+    LeastAllocated,
+    /// Prefer the node with the least free headroom — bin-packs so idle
+    /// nodes can scale down.
+    MostAllocated,
+}
+
+impl ScoringStrategy {
+    /// Read from `SUPERKUBE_SCHEDULER_SCORING`. Anything matching
+    /// `most`/`mostAllocated`/`most-allocated`/`bin-pack`/`binpack`
+    /// (case-insensitive) selects MostAllocated; everything else, including
+    /// unset, defaults to LeastAllocated.
+    fn from_env() -> Self {
+        let v = match std::env::var("SUPERKUBE_SCHEDULER_SCORING") {
+            Ok(v) => v,
+            Err(_) => return Self::default(),
+        };
+        let v = v.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "most" | "mostallocated" | "most-allocated" | "binpack" | "bin-pack" => {
+                Self::MostAllocated
+            }
+            _ => Self::LeastAllocated,
+        }
+    }
+}
+
 impl Scheduler {
     pub fn new(pool: AnyPool, leases: LeaseManager) -> Self {
-        Self { pool, leases }
+        let strategy = ScoringStrategy::from_env();
+        tracing::info!("Scheduler scoring strategy: {:?}", strategy);
+        Self { pool, leases, strategy }
     }
 
     /// Run the scheduler loop. In Postgres mode the lease ensures only one
@@ -66,16 +101,26 @@ impl Scheduler {
         // Pre-fetch all currently-bound pods. Pod (anti-)affinity needs to
         // know which node each existing pod ended up on. Cheap because the
         // entire cluster's pod list isn't huge.
-        let existing_pods = PodRepository::list(&self.pool, None, None).await.unwrap_or_default();
+        // Mutable so we can record in-tick bindings and prevent every pod in
+        // a batch from landing on the same "least-loaded" node.
+        let mut existing_pods =
+            PodRepository::list(&self.pool, None, None).await.unwrap_or_default();
 
         for pod in pods {
-            if let Err(e) = self.schedule_pod(&pod, &nodes, &existing_pods).await {
-                tracing::warn!(
-                    "Failed to schedule pod {}/{}: {}",
-                    pod.metadata.namespace(),
-                    pod.metadata.name(),
-                    e
-                );
+            match self.schedule_pod(&pod, &nodes, &existing_pods).await {
+                Ok(node_name) => {
+                    let mut bound = pod.clone();
+                    bound.spec.node_name = Some(node_name);
+                    existing_pods.push(bound);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to schedule pod {}/{}: {}",
+                        pod.metadata.namespace(),
+                        pod.metadata.name(),
+                        e
+                    );
+                }
             }
         }
         Ok(())
@@ -86,11 +131,11 @@ impl Scheduler {
         pod: &Pod,
         nodes: &[Node],
         existing_pods: &[Pod],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
         let namespace = pod.metadata.namespace();
         let pod_name = pod.metadata.name();
 
-        let node = find_node_for_pod(pod, nodes, existing_pods)?;
+        let node = find_node_for_pod(pod, nodes, existing_pods, self.strategy)?;
         let node_name = node.metadata.name();
 
         tracing::info!(
@@ -119,7 +164,7 @@ impl Scheduler {
         )
         .await;
 
-        Ok(())
+        Ok(node_name.to_string())
     }
 }
 
@@ -131,11 +176,13 @@ fn find_node_for_pod<'a>(
     pod: &Pod,
     nodes: &'a [Node],
     existing_pods: &[Pod],
+    strategy: ScoringStrategy,
 ) -> anyhow::Result<&'a Node> {
     let node_selector = pod.spec.node_selector.as_ref();
     let affinity = pod.spec.affinity.as_ref();
     let (pod_cpu_m, pod_mem_b) = sum_pod_requests(pod);
 
+    let mut candidates: Vec<&'a Node> = Vec::new();
     for node in nodes {
         // 1. Node must be Ready.
         if !is_node_ready(node) {
@@ -199,10 +246,96 @@ fn find_node_for_pod<'a>(
             continue;
         }
 
-        return Ok(node);
+        candidates.push(node);
     }
 
-    anyhow::bail!("No suitable node found for pod")
+    // Pick the highest-scoring candidate. Ties go to the earlier node, which
+    // gives stable ordering for callers that pre-sort `nodes`.
+    candidates
+        .into_iter()
+        .map(|n| {
+            let s = score_node(n, existing_pods, pod_cpu_m, pod_mem_b, strategy);
+            (n, s)
+        })
+        .max_by_key(|(_, s)| *s)
+        .map(|(n, _)| n)
+        .ok_or_else(|| anyhow::anyhow!("No suitable node found for pod"))
+}
+
+/// Score a candidate node from 0..=100. Higher is always better; the
+/// `strategy` decides what "better" means. Scoring assumes the candidate pod
+/// is already placed on this node (so equally-loaded peers diverge as a
+/// batch is scheduled).
+///
+/// LeastAllocated  → percent free (post-placement), averaged over cpu+memory.
+/// MostAllocated   → percent used (post-placement), averaged over cpu+memory.
+///
+/// Resources whose allocatable is missing or zero are skipped from the
+/// average; if neither cpu nor memory has usable data, the score is 0.
+fn score_node(
+    node: &Node,
+    existing_pods: &[Pod],
+    pod_cpu_m: u64,
+    pod_mem_b: u64,
+    strategy: ScoringStrategy,
+) -> i64 {
+    let (used_cpu_m, used_mem_b) = sum_used_on_node(node, existing_pods);
+    let alloc = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
+    let alloc_cpu = alloc
+        .and_then(|a| a.get("cpu"))
+        .and_then(|s| parse_cpu_millicores(s));
+    let alloc_mem = alloc
+        .and_then(|a| a.get("memory"))
+        .and_then(|s| parse_memory_bytes(s));
+
+    let mut sum: f64 = 0.0;
+    let mut n: u32 = 0;
+
+    if let Some(c) = alloc_cpu.filter(|c| *c > 0) {
+        let used_after = used_cpu_m.saturating_add(pod_cpu_m).min(c);
+        let used_pct = (used_after as f64 / c as f64) * 100.0;
+        sum += match strategy {
+            ScoringStrategy::LeastAllocated => 100.0 - used_pct,
+            ScoringStrategy::MostAllocated => used_pct,
+        };
+        n += 1;
+    }
+    if let Some(m) = alloc_mem.filter(|m| *m > 0) {
+        let used_after = used_mem_b.saturating_add(pod_mem_b).min(m);
+        let used_pct = (used_after as f64 / m as f64) * 100.0;
+        sum += match strategy {
+            ScoringStrategy::LeastAllocated => 100.0 - used_pct,
+            ScoringStrategy::MostAllocated => used_pct,
+        };
+        n += 1;
+    }
+
+    if n == 0 {
+        return 0;
+    }
+    (sum / n as f64).round() as i64
+}
+
+/// Sum cpu (millicores) and memory (bytes) requests of non-terminal pods
+/// already bound to `node`.
+fn sum_used_on_node(node: &Node, existing_pods: &[Pod]) -> (u64, u64) {
+    let node_name = node.metadata.name();
+    let mut cpu_m: u64 = 0;
+    let mut mem_b: u64 = 0;
+    for p in existing_pods {
+        if p.spec.node_name.as_deref() != Some(node_name) {
+            continue;
+        }
+        if let Some(s) = p.status.as_ref() {
+            if matches!(s.phase, PodPhase::Succeeded | PodPhase::Failed) {
+                continue;
+            }
+        }
+        let (c, m) = sum_pod_requests(p);
+        cpu_m = cpu_m.saturating_add(c);
+        mem_b = mem_b.saturating_add(m);
+    }
+    (cpu_m, mem_b)
 }
 
 /// Sum of `containers[].resources.requests` for cpu (millicores) and memory
@@ -228,23 +361,7 @@ fn sum_pod_requests(pod: &Pod) -> (u64, u64) {
 /// Whether `node`'s allocatable cpu/memory can accommodate `pod_cpu_m` /
 /// `pod_mem_b` in addition to the already-bound, non-terminal pods on it.
 fn node_fits(node: &Node, existing_pods: &[Pod], pod_cpu_m: u64, pod_mem_b: u64) -> bool {
-    let node_name = node.metadata.name();
-    let mut used_cpu_m: u64 = 0;
-    let mut used_mem_b: u64 = 0;
-    for p in existing_pods {
-        if p.spec.node_name.as_deref() != Some(node_name) {
-            continue;
-        }
-        // Terminal pods don't consume resources.
-        if let Some(s) = p.status.as_ref() {
-            if matches!(s.phase, PodPhase::Succeeded | PodPhase::Failed) {
-                continue;
-            }
-        }
-        let (c, m) = sum_pod_requests(p);
-        used_cpu_m = used_cpu_m.saturating_add(c);
-        used_mem_b = used_mem_b.saturating_add(m);
-    }
+    let (used_cpu_m, used_mem_b) = sum_used_on_node(node, existing_pods);
 
     let allocatable = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
 
