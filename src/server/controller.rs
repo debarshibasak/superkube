@@ -18,6 +18,7 @@ use crate::models::{
 pub struct ControllerManager {
     pool: AnyPool,
     leases: LeaseManager,
+    bus: std::sync::Arc<super::bus::Bus>,
 }
 
 /// How long a per-controller lease is valid. Comfortably longer than the
@@ -26,8 +27,12 @@ pub struct ControllerManager {
 const LEASE_TTL: Duration = Duration::from_secs(30);
 
 impl ControllerManager {
-    pub fn new(pool: AnyPool, leases: LeaseManager) -> Self {
-        Self { pool, leases }
+    pub fn new(
+        pool: AnyPool,
+        leases: LeaseManager,
+        bus: std::sync::Arc<super::bus::Bus>,
+    ) -> Self {
+        Self { pool, leases, bus }
     }
 
     /// Run all controllers. In Postgres mode each reconcile pass first
@@ -206,6 +211,7 @@ impl ControllerManager {
             for pod in owned_pods.iter().take(to_delete as usize) {
                 if let Some(name) = &pod.metadata.name {
                     let _ = PodRepository::delete(&self.pool, namespace, name).await;
+                    self.bus.publish_deleted("Pod", Some(namespace), name, pod);
                 }
             }
         }
@@ -283,6 +289,8 @@ impl ControllerManager {
         };
 
         PodRepository::create(&self.pool, &pod).await?;
+        self.bus
+            .publish_added("Pod", Some(namespace), &pod_name, &pod);
         tracing::info!("Created pod {} in namespace {}", pod_name, namespace);
 
         Ok(())
@@ -364,6 +372,8 @@ impl ControllerManager {
                             namespace, name, pod_name, e);
                         break;
                     }
+                    self.bus
+                        .publish_added("Pod", Some(namespace), &pod_name, &pod);
                     tracing::info!("statefulset {}/{}: created pod {}", namespace, name, pod_name);
                     emit_event(
                         &self.pool,
@@ -387,8 +397,10 @@ impl ControllerManager {
         for i in (desired..desired + 32).rev() {
             // (lo bound: desired; hi bound: 32 above, an arbitrary safety cap)
             let pod_name = format!("{}-{}", name, i);
-            if PodRepository::get(&self.pool, namespace, &pod_name).await.is_ok() {
+            if let Ok(pre) = PodRepository::get(&self.pool, namespace, &pod_name).await {
                 let _ = PodRepository::delete(&self.pool, namespace, &pod_name).await;
+                self.bus
+                    .publish_deleted("Pod", Some(namespace), &pod_name, &pre);
                 tracing::info!("statefulset {}/{}: deleted pod {} (scale-down)",
                     namespace, name, pod_name);
             }
@@ -488,6 +500,8 @@ impl ControllerManager {
                     namespace, name, node_name, e);
                 continue;
             }
+            self.bus
+                .publish_added("Pod", Some(namespace), &pod_name, &pod);
             tracing::info!("daemonset {}/{}: created pod {} on node {}",
                 namespace, name, pod_name, node_name);
             emit_event(
@@ -564,6 +578,9 @@ impl ControllerManager {
                         ..Default::default()
                     };
                     let _ = PodRepository::update_status(&self.pool, &namespace, &pod_name, &new_status).await;
+                    if let Ok(updated) = PodRepository::get(&self.pool, &namespace, &pod_name).await {
+                        self.bus.publish_modified("Pod", Some(&namespace), &pod_name, &updated);
+                    }
                     tracing::warn!("pod {}/{}: node {} not Ready, marking Failed",
                         namespace, pod_name, node_name);
                     emit_event(
@@ -593,6 +610,8 @@ impl ControllerManager {
             let policy = pod.spec.restart_policy.clone().unwrap_or(RestartPolicy::Always);
             if !owned && phase == PodPhase::Failed && matches!(policy, RestartPolicy::Always) {
                 let _ = PodRepository::delete(&self.pool, &namespace, &pod_name).await;
+                self.bus
+                    .publish_deleted("Pod", Some(&namespace), &pod_name, &pod);
                 let mut respun = pod.clone();
                 respun.spec.node_name = None;
                 respun.metadata.uid = Some(Uuid::new_v4());
@@ -601,6 +620,8 @@ impl ControllerManager {
                     ..Default::default()
                 });
                 let _ = PodRepository::create(&self.pool, &respun).await;
+                self.bus
+                    .publish_added("Pod", Some(&namespace), &pod_name, &respun);
                 tracing::info!("pod {}/{}: restartPolicy=Always, re-creating", namespace, pod_name);
             }
         }

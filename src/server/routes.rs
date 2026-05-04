@@ -1,11 +1,45 @@
 use axum::{
+    extract::Request,
+    http::HeaderValue,
+    middleware::{self, Next},
+    response::Response,
     routing::get,
     Router,
 };
 use std::sync::Arc;
 
 use super::api;
+use super::table::WATCH_HEADER;
 use super::AppState;
+
+/// Detect `?watch=true|1` in the request URI and stamp it onto a header
+/// (`x-kais-watch: 1`) so [`super::table::list_response`] can branch on it
+/// without every list handler having to thread the URI through. Watches
+/// MUST emit a `WatchEvent` stream — never a `Table` — or kubectl errors
+/// with `no kind "Table" is registered`.
+async fn watch_middleware(mut req: Request, next: Next) -> Response {
+    if let Some(q) = req.uri().query() {
+        if has_watch_flag(q) {
+            req.headers_mut()
+                .insert(WATCH_HEADER, HeaderValue::from_static("1"));
+        }
+    }
+    next.run(req).await
+}
+
+fn has_watch_flag(query: &str) -> bool {
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some("watch") {
+            match it.next() {
+                None => return true,             // bare `watch`
+                Some("1") | Some("true") => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
 
 pub fn api_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -238,4 +272,5 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .put(api::update_cluster_role_binding)
                 .delete(api::delete_cluster_role_binding),
         )
+        .layer(middleware::from_fn(watch_middleware))
 }

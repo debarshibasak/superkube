@@ -4000,6 +4000,7 @@ dependencies = [
  "tar",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-test",
  "tokio-tungstenite",
  "tokio-util",
@@ -4298,6 +4299,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+pub mod change_log;
 mod lease;
 mod repository;
 

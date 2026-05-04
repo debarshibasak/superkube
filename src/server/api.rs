@@ -23,6 +23,7 @@ use crate::db::{
 use crate::error::Result;
 use crate::models::*;
 
+use super::bus::WatchFilter;
 use super::printers;
 use super::table;
 use super::AppState;
@@ -308,8 +309,15 @@ pub async fn list_pods(
 ) -> Result<Response> {
     let label_selector = params.parse_label_selector();
     let pods = PodRepository::list(&state.pool, Some(&namespace), label_selector.as_ref()).await?;
-    Ok(table::list_response(
-        &headers, "v1", "PodList", pods, printers::POD_COLUMNS, printers::pod_row,
+    Ok(table::list_response_live(
+        &headers,
+        "v1",
+        "PodList",
+        pods,
+        printers::POD_COLUMNS,
+        printers::pod_row,
+        WatchFilter { kind: "Pod", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -320,8 +328,15 @@ pub async fn list_all_pods(
 ) -> Result<Response> {
     let label_selector = params.parse_label_selector();
     let pods = PodRepository::list(&state.pool, None, label_selector.as_ref()).await?;
-    Ok(table::list_response(
-        &headers, "v1", "PodList", pods, printers::POD_COLUMNS, printers::pod_row,
+    Ok(table::list_response_live(
+        &headers,
+        "v1",
+        "PodList",
+        pods,
+        printers::POD_COLUMNS,
+        printers::pod_row,
+        WatchFilter { kind: "Pod", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -346,6 +361,9 @@ pub async fn create_pod(
     let pod_name = pod.metadata.name.clone().unwrap_or_default();
     tracing::info!("api: create pod {}/{}", namespace, pod_name);
     let created = PodRepository::create(&state.pool, &pod).await?;
+    state
+        .bus
+        .publish_added("Pod", Some(&namespace), &pod_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -355,9 +373,12 @@ pub async fn update_pod(
     Json(mut pod): Json<Pod>,
 ) -> Result<Json<Pod>> {
     tracing::info!("api: update pod {}/{}", namespace, name);
-    pod.metadata.namespace = Some(namespace);
-    pod.metadata.name = Some(name);
+    pod.metadata.namespace = Some(namespace.clone());
+    pod.metadata.name = Some(name.clone());
     let updated = PodRepository::create(&state.pool, &pod).await?;
+    state
+        .bus
+        .publish_modified("Pod", Some(&namespace), &name, &updated);
     Ok(Json(updated))
 }
 
@@ -366,7 +387,15 @@ pub async fn delete_pod(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete pod {}/{}", namespace, name);
+    // Capture the object pre-delete so the WatchEvent payload is the
+    // last-known state (k8s convention for DELETED events).
+    let pre = PodRepository::get(&state.pool, &namespace, &name).await.ok();
     PodRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("Pod", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({
         "apiVersion": "v1",
         "kind": "Status",
@@ -402,6 +431,9 @@ pub async fn update_pod_status(
         PodRepository::update_status(&state.pool, &namespace, &name, status).await?;
     }
     let updated = PodRepository::get(&state.pool, &namespace, &name).await?;
+    state
+        .bus
+        .publish_modified("Pod", Some(&namespace), &name, &updated);
     Ok(Json(updated))
 }
 
@@ -1063,8 +1095,15 @@ pub async fn list_services(
     headers: HeaderMap,
 ) -> Result<Response> {
     let services = ServiceRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
-        &headers, "v1", "ServiceList", services, printers::SERVICE_COLUMNS, printers::service_row,
+    Ok(table::list_response_live(
+        &headers,
+        "v1",
+        "ServiceList",
+        services,
+        printers::SERVICE_COLUMNS,
+        printers::service_row,
+        WatchFilter { kind: "Service", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -1073,8 +1112,15 @@ pub async fn list_all_services(
     headers: HeaderMap,
 ) -> Result<Response> {
     let services = ServiceRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
-        &headers, "v1", "ServiceList", services, printers::SERVICE_COLUMNS, printers::service_row,
+    Ok(table::list_response_live(
+        &headers,
+        "v1",
+        "ServiceList",
+        services,
+        printers::SERVICE_COLUMNS,
+        printers::service_row,
+        WatchFilter { kind: "Service", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1116,6 +1162,9 @@ pub async fn create_service(
         service.spec.cluster_ip
     );
     let created = ServiceRepository::create(&state.pool, &service).await?;
+    state
+        .bus
+        .publish_added("Service", Some(&namespace), &svc_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1125,9 +1174,12 @@ pub async fn update_service(
     Json(mut service): Json<Service>,
 ) -> Result<Json<Service>> {
     tracing::info!("api: update service {}/{}", namespace, name);
-    service.metadata.namespace = Some(namespace);
-    service.metadata.name = Some(name);
+    service.metadata.namespace = Some(namespace.clone());
+    service.metadata.name = Some(name.clone());
     let updated = ServiceRepository::create(&state.pool, &service).await?;
+    state
+        .bus
+        .publish_modified("Service", Some(&namespace), &name, &updated);
     Ok(Json(updated))
 }
 
@@ -1136,7 +1188,13 @@ pub async fn delete_service(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete service {}/{}", namespace, name);
+    let pre = ServiceRepository::get(&state.pool, &namespace, &name).await.ok();
     ServiceRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("Service", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({
         "apiVersion": "v1",
         "kind": "Status",
@@ -1158,8 +1216,15 @@ pub async fn list_nodes(
     headers: HeaderMap,
 ) -> Result<Response> {
     let nodes = NodeRepository::list(&state.pool).await?;
-    Ok(table::list_response(
-        &headers, "v1", "NodeList", nodes, printers::NODE_COLUMNS, printers::node_row,
+    Ok(table::list_response_live(
+        &headers,
+        "v1",
+        "NodeList",
+        nodes,
+        printers::NODE_COLUMNS,
+        printers::node_row,
+        WatchFilter { kind: "Node", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1178,11 +1243,10 @@ pub async fn create_node(
     State(state): State<Arc<AppState>>,
     Json(node): Json<Node>,
 ) -> Result<(StatusCode, Json<Node>)> {
-    tracing::info!(
-        "api: register node {}",
-        node.metadata.name.clone().unwrap_or_default()
-    );
+    let node_name = node.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: register node {}", node_name);
     let created = NodeRepository::create(&state.pool, &node).await?;
+    state.bus.publish_added("Node", None, &node_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1192,8 +1256,9 @@ pub async fn update_node(
     Json(mut node): Json<Node>,
 ) -> Result<Json<Node>> {
     tracing::info!("api: update node {}", name);
-    node.metadata.name = Some(name);
+    node.metadata.name = Some(name.clone());
     let updated = NodeRepository::create(&state.pool, &node).await?;
+    state.bus.publish_modified("Node", None, &name, &updated);
     Ok(Json(updated))
 }
 
@@ -1202,7 +1267,11 @@ pub async fn delete_node(
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete node {}", name);
+    let pre = NodeRepository::get(&state.pool, &name).await.ok();
     NodeRepository::delete(&state.pool, &name).await?;
+    if let Some(obj) = pre {
+        state.bus.publish_deleted("Node", None, &name, &obj);
+    }
     Ok(Json(json!({
         "apiVersion": "v1",
         "kind": "Status",
@@ -1245,13 +1314,15 @@ pub async fn list_deployments(
     headers: HeaderMap,
 ) -> Result<Response> {
     let deployments = DeploymentRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "apps/v1",
         "DeploymentList",
         deployments,
         printers::DEPLOYMENT_COLUMNS,
         printers::deployment_row,
+        WatchFilter { kind: "Deployment", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -1260,13 +1331,15 @@ pub async fn list_all_deployments(
     headers: HeaderMap,
 ) -> Result<Response> {
     let deployments = DeploymentRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "apps/v1",
         "DeploymentList",
         deployments,
         printers::DEPLOYMENT_COLUMNS,
         printers::deployment_row,
+        WatchFilter { kind: "Deployment", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1300,6 +1373,9 @@ pub async fn create_deployment(
         deployment.spec.replicas.unwrap_or(1)
     );
     let created = DeploymentRepository::create(&state.pool, &deployment).await?;
+    state
+        .bus
+        .publish_added("Deployment", Some(&namespace), &dep_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1314,9 +1390,12 @@ pub async fn update_deployment(
         name,
         deployment.spec.replicas.unwrap_or(1)
     );
-    deployment.metadata.namespace = Some(namespace);
-    deployment.metadata.name = Some(name);
+    deployment.metadata.namespace = Some(namespace.clone());
+    deployment.metadata.name = Some(name.clone());
     let updated = DeploymentRepository::create(&state.pool, &deployment).await?;
+    state
+        .bus
+        .publish_modified("Deployment", Some(&namespace), &name, &updated);
     Ok(Json(updated))
 }
 
@@ -1337,12 +1416,24 @@ pub async fn delete_deployment(
                     pod_name,
                     name
                 );
+                // Best-effort publish before delete so watchers see the
+                // cascade. The pod might already have been gc'd; that's
+                // fine — a missing object just means no event.
+                let pod_pre = PodRepository::get(&state.pool, &namespace, &pod_name).await.ok();
                 let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
+                if let Some(p) = pod_pre {
+                    state
+                        .bus
+                        .publish_deleted("Pod", Some(&namespace), &pod_name, &p);
+                }
             }
         }
     }
 
     DeploymentRepository::delete(&state.pool, &namespace, &name).await?;
+    state
+        .bus
+        .publish_deleted("Deployment", Some(&namespace), &name, &deployment);
     Ok(Json(json!({
         "apiVersion": "v1",
         "kind": "Status",
@@ -1365,13 +1456,15 @@ pub async fn list_namespaces(
     headers: HeaderMap,
 ) -> Result<Response> {
     let namespaces = NamespaceRepository::list(&state.pool).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "v1",
         "NamespaceList",
         namespaces,
         printers::NAMESPACE_COLUMNS,
         printers::namespace_row,
+        WatchFilter { kind: "Namespace", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1393,11 +1486,12 @@ pub async fn create_namespace(
     State(state): State<Arc<AppState>>,
     Json(namespace): Json<Namespace>,
 ) -> Result<(StatusCode, Json<Namespace>)> {
-    tracing::info!(
-        "api: create namespace {}",
-        namespace.metadata.name.clone().unwrap_or_default()
-    );
+    let ns_name = namespace.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create namespace {}", ns_name);
     let created = NamespaceRepository::create(&state.pool, &namespace).await?;
+    state
+        .bus
+        .publish_added("Namespace", None, &ns_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1407,8 +1501,11 @@ pub async fn update_namespace(
     Json(mut namespace): Json<Namespace>,
 ) -> Result<Json<Namespace>> {
     tracing::info!("api: update namespace {}", name);
-    namespace.metadata.name = Some(name);
+    namespace.metadata.name = Some(name.clone());
     let updated = NamespaceRepository::create(&state.pool, &namespace).await?;
+    state
+        .bus
+        .publish_modified("Namespace", None, &name, &updated);
     Ok(Json(updated))
 }
 
@@ -1417,7 +1514,13 @@ pub async fn delete_namespace(
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete namespace {}", name);
+    let pre = NamespaceRepository::get(&state.pool, &name).await.ok();
     NamespaceRepository::delete(&state.pool, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("Namespace", None, &name, &obj);
+    }
     Ok(Json(json!({
         "apiVersion": "v1",
         "kind": "Status",

@@ -11,6 +11,7 @@ pub struct Scheduler {
     pool: AnyPool,
     leases: LeaseManager,
     strategy: ScoringStrategy,
+    bus: std::sync::Arc<super::bus::Bus>,
 }
 
 /// Scheduler lease TTL. Multi-master setups must guarantee only one
@@ -51,10 +52,14 @@ impl ScoringStrategy {
 }
 
 impl Scheduler {
-    pub fn new(pool: AnyPool, leases: LeaseManager) -> Self {
+    pub fn new(
+        pool: AnyPool,
+        leases: LeaseManager,
+        bus: std::sync::Arc<super::bus::Bus>,
+    ) -> Self {
         let strategy = ScoringStrategy::from_env();
         tracing::info!("Scheduler scoring strategy: {:?}", strategy);
-        Self { pool, leases, strategy }
+        Self { pool, leases, strategy, bus }
     }
 
     /// Run the scheduler loop. In Postgres mode the lease ensures only one
@@ -144,6 +149,16 @@ impl Scheduler {
         );
 
         PodRepository::bind_to_node(&self.pool, namespace, pod_name, node_name).await?;
+
+        // Publish a watch event so anything listening on `kubectl get pods -w`
+        // sees the bind immediately. Best-effort — a missed read here just
+        // means watchers see the change on the next reconcile or list.
+        if let Ok(updated) =
+            PodRepository::get(&self.pool, namespace, pod_name).await
+        {
+            self.bus
+                .publish_modified("Pod", Some(namespace), pod_name, &updated);
+        }
 
         controller::emit_event(
             &self.pool,

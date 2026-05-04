@@ -74,6 +74,9 @@ serde_urlencoded = "0.7"
 wasmtime = { version = "33", features = ["async"] }
 wasmtime-wasi = "33"
 tokio-util = { version = "0.7.18", features = ["io"] }
+# Bridges tokio::sync::broadcast / mpsc receivers into futures::Stream so the
+# watch path can pipe live change events into an axum chunked body.
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # libcontainer (youki) drives namespaces / cgroups / pivot_root.
 # Linux-only: it pulls in nix, libseccomp, etc. that don't build on macOS.
