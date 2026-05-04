@@ -24,9 +24,6 @@ pub use scheduler::Scheduler;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: AnyPool,
-    /// Pod CIDR (e.g. "10.244.0.0/16"). Embedded agent uses the first
-    /// three octets as the /24 it allocates pod IPs from.
-    pub pod_cidr: String,
     /// Service CIDR (e.g. "10.96.0.0/12"). Used for ClusterIP auto-assign.
     pub service_cidr: String,
     /// In-process change feed for `?watch=true` endpoints. Handlers
@@ -78,22 +75,18 @@ pub async fn run(
     let bus = std::sync::Arc::new(match backend {
         Backend::Postgres => {
             tracing::info!("watch bus: replicating across servers via LISTEN/NOTIFY");
-            bus::Bus::new_replicated(
-                instance_id.clone(),
-                bus::Replicator {
-                    pool: pool.clone(),
-                    instance_id: instance_id.clone(),
-                    channel: bus::DEFAULT_NOTIFY_CHANNEL.to_string(),
-                },
-            )
+            bus::Bus::new_replicated(bus::Replicator {
+                pool: pool.clone(),
+                instance_id: instance_id.clone(),
+                channel: bus::DEFAULT_NOTIFY_CHANNEL.to_string(),
+            })
         }
-        Backend::Sqlite => bus::Bus::new(instance_id.clone()),
+        Backend::Sqlite => bus::Bus::new(),
     });
 
     // Create app state
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        pod_cidr: pod_cidr.to_string(),
         service_cidr: service_cidr.to_string(),
         bus: bus.clone(),
     });

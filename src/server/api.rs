@@ -40,14 +40,19 @@ fn service_cidr_prefix(cidr: &str) -> String {
     }
 }
 
-// Query parameters for list operations
+// Query parameters for list operations. The fields beyond `label_selector`
+// are accepted from kubectl for protocol compatibility but currently
+// ignored by handlers.
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ListParams {
     pub label_selector: Option<String>,
+    #[allow(dead_code)]
     pub field_selector: Option<String>,
+    #[allow(dead_code)]
     pub limit: Option<i64>,
     #[serde(rename = "continue")]
+    #[allow(dead_code)]
     pub continue_token: Option<String>,
 }
 
@@ -120,25 +125,6 @@ pub async fn openapi_v2(_headers: HeaderMap) -> Response {
 /// JSON is fine. Empty paths == "no schemas".
 pub async fn openapi_v3(_headers: HeaderMap) -> Response {
     Json(json!({ "paths": {} })).into_response()
-}
-
-fn pick_proto_v2(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(axum::http::header::ACCEPT)?.to_str().ok()?;
-    raw.split(',')
-        .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
-        .find(|s| s.contains("proto-openapi"))
-}
-
-fn empty_proto_response(content_type: &str) -> Response {
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .body(axum::body::Body::from(Vec::<u8>::new()))
-        .unwrap();
-    if let Ok(value) = axum::http::HeaderValue::from_str(content_type) {
-        resp.headers_mut()
-            .insert(axum::http::header::CONTENT_TYPE, value);
-    }
-    resp
 }
 
 pub async fn api_v1_resources() -> Json<Value> {

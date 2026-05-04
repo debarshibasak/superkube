@@ -1,9 +1,10 @@
 //! Embedded OCI runtime: pulls images and (on Linux) runs containers via
 //! `libcontainer` — no host containerd / runc / CNI required.
 //!
-//! Currently in-progress. The cross-platform pieces (image pull, bundle
-//! generation) live here; the `libcontainer`-driven runtime is Linux-only and
-//! lives in `container.rs` (TODO).
+//! `bundle` is Linux-only because it's wired into the libcontainer-backed
+//! `embedded` runtime; `image` is cross-platform (the wasm runtime uses
+//! [`image::pull_wasm`] on every host).
 
+#[cfg(target_os = "linux")]
 pub mod bundle;
 pub mod image;

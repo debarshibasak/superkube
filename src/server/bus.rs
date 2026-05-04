@@ -62,6 +62,9 @@ pub struct ChangeEvent {
     pub kind: &'static str,
     /// `None` for cluster-scoped resources (Node, Namespace, ...).
     pub namespace: Option<String>,
+    /// Object name. Carried for cross-process replication and logging;
+    /// the local watch path filters on kind/namespace only.
+    #[allow(dead_code)]
     pub name: String,
     pub event_type: WatchEventType,
     /// JSON-serialized object — the full resource as it exists *after*
@@ -107,11 +110,6 @@ pub const DEFAULT_NOTIFY_CHANNEL: &str = "kais_changes";
 /// Process-wide event publisher.
 pub struct Bus {
     tx: broadcast::Sender<ChangeEvent>,
-    /// Stable identity for this server process, used by [`Replicator`] to
-    /// drop our own echoes when they come back via LISTEN. Always set,
-    /// even in SQLite mode (in that case it just isn't compared against
-    /// anything).
-    instance_id: String,
     /// `None` ⇒ local-only (SQLite, or Postgres before the listener task
     /// has started). `Some` ⇒ every publish is also persisted to
     /// `change_log` and broadcast via `pg_notify`.
@@ -120,11 +118,10 @@ pub struct Bus {
 
 impl Bus {
     /// Local-only bus (SQLite mode, or pre-replicator wiring during boot).
-    pub fn new(instance_id: String) -> Self {
+    pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(BUS_CAPACITY);
         Self {
             tx,
-            instance_id,
             replicator: None,
         }
     }
@@ -132,17 +129,12 @@ impl Bus {
     /// Bus with cross-process replication wired up. The listener task in
     /// [`super::run`] still has to be started separately so peers can
     /// observe what we publish here.
-    pub fn new_replicated(instance_id: String, replicator: Replicator) -> Self {
+    pub fn new_replicated(replicator: Replicator) -> Self {
         let (tx, _rx) = broadcast::channel(BUS_CAPACITY);
         Self {
             tx,
-            instance_id,
             replicator: Some(Arc::new(replicator)),
         }
-    }
-
-    pub fn instance_id(&self) -> &str {
-        &self.instance_id
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
@@ -230,7 +222,7 @@ impl Bus {
 
 impl Default for Bus {
     fn default() -> Self {
-        Self::new(uuid::Uuid::new_v4().to_string())
+        Self::new()
     }
 }
 

@@ -13,7 +13,6 @@ use uuid::Uuid;
 /// originating server's instance id so peers can skip their own echoes.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChangeLogRow {
-    pub id: String,
     pub instance_id: String,
     pub kind: String,
     pub namespace: Option<String>,
@@ -61,7 +60,7 @@ pub async fn insert(
 /// it (slow listener, very unlikely under normal load).
 pub async fn fetch(pool: &AnyPool, id: &str) -> sqlx::Result<Option<ChangeLogRow>> {
     sqlx::query_as::<_, ChangeLogRow>(
-        "SELECT id, instance_id, kind, namespace, name, event_type, object \
+        "SELECT instance_id, kind, namespace, name, event_type, object \
          FROM change_log WHERE id = ?",
     )
     .bind(id)

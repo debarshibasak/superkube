@@ -300,13 +300,6 @@ impl Runtime for WasmRuntime {
         Ok(id)
     }
 
-    async fn is_container_running(&self, container_id: &str) -> anyhow::Result<bool> {
-        match self.containers.get(container_id) {
-            Some(e) => Ok(running(e).await),
-            None => Ok(false),
-        }
-    }
-
     async fn find_container(&self, name: &str) -> anyhow::Result<Option<ContainerInfo>> {
         let id = match self.by_name.get(name) {
             Some(id) => id,
@@ -456,9 +449,7 @@ impl Runtime for WasmRuntime {
             merged.map(|r| r.map(Bytes::from).map_err(anyhow::Error::from)),
         );
 
-        let session_id = format!("wasm-exec://{}", Uuid::new_v4());
         Ok(ExecSession {
-            id: session_id,
             output,
             input: Box::pin(stdin_client_write),
             // wasm has no terminal — resize is a no-op.

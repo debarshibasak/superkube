@@ -10,7 +10,6 @@ use super::{ContainerInfo, LogOptions, Runtime};
 /// a real container engine. Useful on platforms where neither Docker nor
 /// libcontainer is available, and as a baseline for tests.
 pub struct ContainerdRuntime {
-    socket_path: String,
     containers: HashMap<String, ContainerState>,
     /// Reverse index: container_name → container_id. Lets `find_container`
     /// behave like Docker (lookup by name).
@@ -19,8 +18,6 @@ pub struct ContainerdRuntime {
 
 struct ContainerState {
     id: String,
-    name: String,
-    image: String,
     running: bool,
     started_at: DateTime<Utc>,
     logs: Vec<LogEntry>,
@@ -41,7 +38,6 @@ impl ContainerdRuntime {
             );
         }
         Ok(Self {
-            socket_path: socket_path.to_string(),
             containers: HashMap::new(),
             by_name: HashMap::new(),
         })
@@ -87,8 +83,6 @@ impl Runtime for ContainerdRuntime {
             container_id.clone(),
             ContainerState {
                 id: container_id.clone(),
-                name: name.to_string(),
-                image: image.clone(),
                 running: true,
                 started_at: now,
                 logs,
@@ -98,14 +92,6 @@ impl Runtime for ContainerdRuntime {
 
         tracing::info!("Mock container {} started with ID {}", name, container_id);
         Ok(container_id)
-    }
-
-    async fn is_container_running(&self, container_id: &str) -> anyhow::Result<bool> {
-        Ok(self
-            .containers
-            .get(container_id)
-            .map(|c| c.running)
-            .unwrap_or(false))
     }
 
     async fn find_container(&self, name: &str) -> anyhow::Result<Option<ContainerInfo>> {

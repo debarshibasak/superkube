@@ -274,11 +274,6 @@ impl Runtime for EmbeddedRuntime {
         Ok(id)
     }
 
-    async fn is_container_running(&self, id: &str) -> anyhow::Result<bool> {
-        let info = self.find_container(Self::strip(id)).await?;
-        Ok(info.map(|i| i.running).unwrap_or(false))
-    }
-
     async fn find_container(&self, name: &str) -> anyhow::Result<Option<ContainerInfo>> {
         let map = self.containers.lock().await;
         let id = format!("{ID_PREFIX}{}", name);

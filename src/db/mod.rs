@@ -30,13 +30,6 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<AnyPool> {
     Ok(pool)
 }
 
-/// Run database migrations.
-pub async fn migrate(database_url: &str) -> anyhow::Result<()> {
-    let pool = create_pool(database_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    Ok(())
-}
-
 fn is_sqlite_url(url: &str) -> bool {
     url.starts_with("sqlite:")
 }

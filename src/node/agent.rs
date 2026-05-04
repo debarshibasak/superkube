@@ -14,7 +14,6 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -32,29 +31,10 @@ const NODE_AGENT_PORT: u16 = 10250;
 /// Run the node agent. `labels` are attached to the registered Node object —
 /// pass `node-role.kubernetes.io/control-plane=""` for the embedded server-side
 /// agent so kubectl shows it under the `control-plane` role.
-pub async fn run(
-    name: &str,
-    server_url: &str,
-    containerd_socket: &str,
-    labels: HashMap<String, String>,
-) -> anyhow::Result<()> {
-    run_with_pod_cidr(name, server_url, containerd_socket, labels, "10.244.0.0/16").await
-}
-
-/// Like [`run`], but lets the caller pin the pod CIDR. The agent uses the /24
-/// prefix to allocate pod IPs.
-pub async fn run_with_pod_cidr(
-    name: &str,
-    server_url: &str,
-    containerd_socket: &str,
-    labels: HashMap<String, String>,
-    pod_cidr: &str,
-) -> anyhow::Result<()> {
-    run_full(name, server_url, containerd_socket, labels, pod_cidr, "auto").await
-}
-
-/// Most-flexible entry point: also accepts a runtime selector string
-/// (`auto`/`docker`/`embedded`/`mock`) to back `--runtime=` on the CLI.
+///
+/// `pod_cidr` is the cluster pod CIDR (e.g. `10.244.0.0/16`); the agent uses
+/// the /24 prefix to allocate pod IPs. `runtime_kind` is the runtime selector
+/// (`auto`/`docker`/`embedded`/`mock`/`wasm`) backing `--runtime=` on the CLI.
 pub async fn run_full(
     name: &str,
     server_url: &str,
@@ -101,24 +81,6 @@ struct NodeAgent {
 }
 
 impl NodeAgent {
-    async fn new(
-        name: &str,
-        server_url: &str,
-        containerd_socket: &str,
-        labels: HashMap<String, String>,
-        pod_cidr: String,
-    ) -> anyhow::Result<Self> {
-        Self::new_with_runtime(
-            name,
-            server_url,
-            containerd_socket,
-            labels,
-            pod_cidr,
-            "auto",
-        )
-        .await
-    }
-
     async fn new_with_runtime(
         name: &str,
         server_url: &str,
@@ -157,7 +119,7 @@ impl NodeAgent {
 
         // Start the HTTP server for log requests
         let http_state = self.state.clone();
-        let http_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = run_http_server(http_state).await {
                 tracing::error!("HTTP server error: {}", e);
             }
@@ -946,8 +908,6 @@ pub struct LogQueryParams {
     pub timestamps: bool,
     #[serde(default)]
     pub follow: bool,
-    #[serde(default)]
-    pub previous: bool,
     pub since_seconds: Option<i64>,
     pub limit_bytes: Option<i64>,
 }
@@ -1186,25 +1146,6 @@ async fn handle_follow_logs(
 // ============================================================================
 // Exec Handler
 // ============================================================================
-
-/// Query parameters for exec requests
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecQueryParams {
-    pub command: Option<String>,
-    #[serde(default)]
-    pub stdin: bool,
-    #[serde(default = "default_true")]
-    pub stdout: bool,
-    #[serde(default = "default_true")]
-    pub stderr: bool,
-    #[serde(default)]
-    pub tty: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
 
 /// Handle exec requests via WebSocket. Uses the Kubernetes channel-prefixed
 /// frame protocol: every binary frame from kubectl is `[channel_byte, data...]`.

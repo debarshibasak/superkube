@@ -45,10 +45,6 @@ impl LeaseManager {
         }
     }
 
-    pub fn backend(&self) -> Backend {
-        self.backend
-    }
-
     pub fn holder(&self) -> &str {
         &self.holder
     }

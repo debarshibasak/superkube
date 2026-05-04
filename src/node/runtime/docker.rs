@@ -193,21 +193,6 @@ impl Runtime for DockerRuntime {
         Ok(id)
     }
 
-    async fn is_container_running(&self, container_id: &str) -> anyhow::Result<bool> {
-        let id = Self::strip(container_id);
-        match self.client.inspect_container(id, None).await {
-            Ok(inspect) => Ok(inspect
-                .state
-                .and_then(|s| s.running)
-                .unwrap_or(false)),
-            // 404 → container deleted out-of-band; treat as not running.
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(false),
-            Err(e) => Err(anyhow::anyhow!("docker inspect {container_id}: {e}")),
-        }
-    }
-
     async fn find_container(&self, name: &str) -> anyhow::Result<Option<ContainerInfo>> {
         // Docker's API accepts a container name in any place that takes an ID.
         match self.client.inspect_container(name, None).await {
@@ -400,7 +385,6 @@ impl Runtime for DockerRuntime {
                 });
 
                 Ok(ExecSession {
-                    id: exec.id,
                     output: Box::pin(mapped),
                     input,
                     resize,

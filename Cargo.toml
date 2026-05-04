@@ -99,3 +99,13 @@ bollard = "0.17"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+# Optimize the release binary for size. The defaults give us ~19MB; with
+# fat LTO + opt-level="z" + a single codegen unit + panic=abort + strip we
+# typically land around 6–8MB. Compile time goes up but ship-time only.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

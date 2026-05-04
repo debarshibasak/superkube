@@ -54,16 +54,6 @@ pub struct ObjectMeta {
 }
 
 impl ObjectMeta {
-    pub fn new(name: &str, namespace: &str) -> Self {
-        Self {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            uid: Some(Uuid::new_v4()),
-            creation_timestamp: Some(Utc::now()),
-            ..Default::default()
-        }
-    }
-
     pub fn name(&self) -> &str {
         self.name.as_deref().unwrap_or("")
     }
@@ -100,20 +90,6 @@ pub struct LabelSelector {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_expressions: Option<Vec<LabelSelectorRequirement>>,
-}
-
-impl LabelSelector {
-    pub fn matches(&self, labels: &HashMap<String, String>) -> bool {
-        // Check matchLabels
-        if let Some(match_labels) = &self.match_labels {
-            for (key, value) in match_labels {
-                if labels.get(key) != Some(value) {
-                    return false;
-                }
-            }
-        }
-        true
-    }
 }
 
 /// LabelSelectorRequirement for complex label matching

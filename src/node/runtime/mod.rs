@@ -85,8 +85,6 @@ pub trait Runtime: Send + Sync {
         container: &Container,
     ) -> anyhow::Result<String>;
 
-    async fn is_container_running(&self, container_id: &str) -> anyhow::Result<bool>;
-
     /// Look up a container by the *name* the agent gave it
     /// (typically `<pod-name>-<container-name>`). Returns `None` if no such
     /// container exists. This is the heart of reconciliation: every tick the
@@ -129,21 +127,16 @@ pub trait Runtime: Send + Sync {
 /// `output`/`input` and the kubectl WebSocket; `resize` is called when the
 /// client sends a terminal-size update.
 pub struct ExecSession {
-    pub id: String,
     pub output: LogStream,
     pub input: Pin<Box<dyn AsyncWrite + Send>>,
     pub resize:
         Box<dyn Fn(u16, u16) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>,
 }
 
-/// Pick the right runtime for the host. macOS → Docker; Linux → embedded;
-/// otherwise mock. Errors fall back to the mock so the agent at least
-/// registers and is observable while you fix the real runtime.
-pub async fn default(socket_path: &str) -> anyhow::Result<Box<dyn Runtime>> {
-    select(socket_path, "auto").await
-}
-
-/// Like `default`, but with an explicit choice from `--runtime=`.
+/// Pick the right runtime for the host based on `--runtime=`. macOS auto →
+/// Docker; Linux auto → embedded; otherwise mock. Errors in auto mode fall
+/// back to the mock so the agent at least registers and is observable while
+/// you fix the real runtime.
 pub async fn select(
     socket_path: &str,
     name: &str,

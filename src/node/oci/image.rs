@@ -20,9 +20,11 @@ use oci_distribution::manifest::{
 };
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
+#[cfg(target_os = "linux")]
 use serde::{Deserialize, Serialize};
 
 /// Subset of the OCI image config we care about for running a container.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageConfig {
     #[serde(default)]
@@ -38,6 +40,7 @@ pub struct ImageConfig {
 }
 
 /// Result of a successful pull.
+#[cfg(target_os = "linux")]
 pub struct PulledImage {
     /// Directory containing the merged rootfs.
     pub rootfs: PathBuf,
@@ -47,6 +50,7 @@ pub struct PulledImage {
 
 /// Pull `reference` (e.g. `"nginx:latest"`, `"docker.io/library/alpine:3.20"`)
 /// into `dest_root`. Re-uses an existing extraction if the sentinel exists.
+#[cfg(target_os = "linux")]
 pub async fn pull(reference: &str, dest_root: &Path) -> anyhow::Result<PulledImage> {
     let reference: Reference = reference
         .parse()
@@ -181,6 +185,7 @@ fn clear_directory(dir: &Path) -> anyhow::Result<()> {
 
 /// Parse the OCI image config blob into the subset we care about. The blob
 /// looks like `{ "config": { "Entrypoint": [...], "Cmd": [...], "Env": [...], ... }, ... }`.
+#[cfg(target_os = "linux")]
 fn parse_config(data: &[u8]) -> anyhow::Result<ImageConfig> {
     let v: serde_json::Value = serde_json::from_slice(data).context("parsing image config")?;
     let cfg = v
@@ -210,6 +215,7 @@ fn parse_config(data: &[u8]) -> anyhow::Result<ImageConfig> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn string_array(v: Option<&serde_json::Value>) -> Vec<String> {
     v.and_then(|v| v.as_array())
         .map(|arr| {

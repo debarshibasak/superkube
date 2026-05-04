@@ -272,23 +272,6 @@ impl PodRepository {
         Ok(rows.into_iter().map(Self::row_to_pod).collect())
     }
 
-    pub async fn list_by_node(pool: &AnyPool, node_name: &str) -> Result<Vec<Pod>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT uid, name, namespace, labels, annotations, spec, status,
-                   node_name, pod_ip, host_ip, container_statuses, owner_reference, created_at
-            FROM pods
-            WHERE node_name = ?
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(node_name)
-        .fetch_all(pool)
-        .await?;
-
-        Ok(rows.into_iter().map(Self::row_to_pod).collect())
-    }
-
     fn row_to_pod(row: sqlx::any::AnyRow) -> Pod {
         let uid: String = row.get("uid");
         let name: String = row.get("name");
@@ -791,23 +774,6 @@ impl NodeRepository {
         Ok(())
     }
 
-    pub async fn update_heartbeat(pool: &AnyPool, name: &str) -> Result<()> {
-        let now = now_str();
-        sqlx::query(
-            r#"
-            UPDATE nodes
-            SET status = 'Ready', updated_at = ?
-            WHERE name = ?
-            "#,
-        )
-        .bind(&now)
-        .bind(name)
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     pub async fn list_ready(pool: &AnyPool) -> Result<Vec<Node>> {
         let rows = sqlx::query(
             r#"
@@ -957,15 +923,6 @@ impl EndpointsRepository {
         })
     }
 
-    pub async fn delete(pool: &AnyPool, namespace: &str, name: &str) -> Result<()> {
-        sqlx::query("DELETE FROM endpoints WHERE namespace = ? AND name = ?")
-            .bind(namespace)
-            .bind(name)
-            .execute(pool)
-            .await?;
-
-        Ok(())
-    }
 }
 
 /// Repository for Namespace operations
@@ -1074,17 +1031,6 @@ impl NamespaceRepository {
         }
 
         Ok(())
-    }
-
-    pub async fn exists(pool: &AnyPool, name: &str) -> Result<bool> {
-        let result: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM namespaces WHERE name = ? AND status = 'Active'",
-        )
-        .bind(name)
-        .fetch_one(pool)
-        .await?;
-
-        Ok(result.0 > 0)
     }
 
     fn row_to_namespace(row: sqlx::any::AnyRow) -> Namespace {
