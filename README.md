@@ -496,6 +496,7 @@ JSON spec/labels/annotations stored as `TEXT`; UUIDs and timestamps as ISO strin
 - **`kubectl apply` on existing objects** uses HTTP `PATCH`, which we don't implement yet. First-time apply (PUT/POST) works; re-applying a changed resource currently fails with `MethodNotAllowed`. Workarounds: `kubectl replace -f file.yaml --force`, or `delete` + `apply`.
 - **Embedded runtime**: skeleton only — image pull and libcontainer wiring are in place, but pod networking, log capture, and exec aren't yet hooked up. On Linux today, `--runtime=docker` is the productive choice.
 - **No CNI**: pod IPs are assigned from `--pod-cidr` (default `10.244.0.0/16`) but pod-to-pod connectivity isn't wired. Service traffic works because the NodePort proxy connects to the host port that Docker publishes for each container.
+- **No CSI / no persistent storage**: there is no CSI driver, and `PersistentVolume`, `PersistentVolumeClaim`, and `StorageClass` are not implemented. Pods can only use the volume types the container runtime gives you for free (`emptyDir`, `hostPath`-style bind mounts via Docker). StatefulSets reconcile their pods but do not provision per-replica volumes.
 - **No RBAC enforcement**: ClusterRole/Binding objects round-trip through the API but are not consulted at request time. The API has no auth.
 - **OpenAPI schemas** aren't generated. We serve a benign empty `/openapi/v2` (zero bytes, parses as an empty protobuf `Document`) and an empty `/openapi/v3` JSON, so kubectl validation passes without `--validate=false`.
 

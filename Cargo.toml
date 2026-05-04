@@ -14,13 +14,25 @@ path = "src/main.rs"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
-# Web framework
+# Web framework. Only the trace layer from tower-http is wired up.
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["trace"] }
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime. We narrow off `full` to the components we actually use:
+#   rt-multi-thread + macros — `#[tokio::main]` and the multi-thread runtime
+#   net + io-util            — TcpListener, async read/write helpers
+#   sync + time              — broadcast/mpsc channels, sleeps & intervals
+#   process + signal         — agent shells out and listens for SIGINT
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "process",
+    "signal",
+] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "any", "postgres", "sqlite"] }
@@ -33,18 +45,16 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# Container runtime
-containerd-client = "0.5"
-tonic = "0.11"
-prost = "0.12"
-
-# Embedded OCI runtime (image pull + bundle generation)
+# Embedded OCI runtime: image pull (cross-platform: wasm runtime uses it)
+# and tar/gzip layer extraction. Default features in reqwest pull in
+# gzip/brotli/deflate which we don't use, so we strip them.
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
-oci-spec = "0.7"
 flate2 = "1"
-tar = "0.4"
-sha2 = "0.10"
-hex = "0.4"
+# Default tar features pull in `xattr` (~140 KB on disk) for unpacking
+# extended attributes from layer tarballs. We don't read xattrs back
+# anywhere, so the runtime cost of dropping it is "OCI images that bake
+# SELinux/file caps lose them on extraction" — acceptable for our use.
+tar = { version = "0.4", default-features = false }
 
 # Logging & errors
 tracing = "0.1"
@@ -52,13 +62,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 anyhow = "1"
 
-# HTTP client (for node agent -> server)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (for node agent -> server). Drop default features to avoid
+# pulling in gzip/brotli/deflate/charset code we never call.
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
 
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
-async-stream = "0.3"
 
 # WebSocket
 tokio-tungstenite = "0.24"
@@ -71,7 +81,19 @@ bytes = "1"
 serde_urlencoded = "0.7"
 # Pinned to a major that still builds on rustc 1.88; bump together with
 # the workspace MSRV. wasmtime ≥ 41 requires rustc ≥ 1.91+.
-wasmtime = { version = "33", features = ["async"] }
+#
+# Strip wasmtime down to what the runtime actually uses: a Cranelift JIT,
+# async store/exec, the module cache, and pooling allocator. We drop
+# component-model, GC, threads/stack-switching, wat parsing, profiling,
+# and debug helpers — none of which are wired up.
+wasmtime = { version = "33", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "async",
+    "cache",
+    "pooling-allocator",
+    "parallel-compilation",
+] }
 wasmtime-wasi = "33"
 tokio-util = { version = "0.7.18", features = ["io"] }
 # Bridges tokio::sync::broadcast / mpsc receivers into futures::Stream so the
@@ -90,6 +112,9 @@ libcontainer = { version = "0.5", default-features = false, features = ["v2", "s
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
 nix = { version = "0.29", features = ["sched", "fs", "mount", "process"] }
+# OCI runtime spec types — only used by the Linux-only bundle generator
+# that feeds libcontainer.
+oci-spec = "0.7"
 
 # bollard talks to the host Docker daemon over /var/run/docker.sock.
 # macOS-only: there, Docker Desktop runs the Linux VM that hosts containers.
