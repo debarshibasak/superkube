@@ -273,12 +273,27 @@ fn spawn_change_log_listener(
                         };
                         // Static-str kinds: we only emit the canonical names
                         // from handlers, so map back via a small whitelist.
+                        // When wiring a new resource into the bus, ALSO add
+                        // its kind here — peer events for unlisted kinds
+                        // are dropped at debug.
                         let kind: &'static str = match row.kind.as_str() {
+                            // Core
                             "Pod" => "Pod",
                             "Service" => "Service",
-                            "Deployment" => "Deployment",
                             "Node" => "Node",
                             "Namespace" => "Namespace",
+                            "ConfigMap" => "ConfigMap",
+                            "Secret" => "Secret",
+                            "ServiceAccount" => "ServiceAccount",
+                            // apps/v1
+                            "Deployment" => "Deployment",
+                            "StatefulSet" => "StatefulSet",
+                            "DaemonSet" => "DaemonSet",
+                            // rbac.authorization.k8s.io/v1
+                            "Role" => "Role",
+                            "RoleBinding" => "RoleBinding",
+                            "ClusterRole" => "ClusterRole",
+                            "ClusterRoleBinding" => "ClusterRoleBinding",
                             other => {
                                 tracing::debug!(
                                     "watch listener: ignoring event for unhandled kind {}",

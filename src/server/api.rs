@@ -1667,13 +1667,15 @@ pub async fn list_statefulsets(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = StatefulSetRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "apps/v1",
         "StatefulSetList",
         items,
         printers::STATEFULSET_COLUMNS,
         printers::statefulset_row,
+        WatchFilter { kind: "StatefulSet", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -1682,13 +1684,15 @@ pub async fn list_all_statefulsets(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = StatefulSetRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "apps/v1",
         "StatefulSetList",
         items,
         printers::STATEFULSET_COLUMNS,
         printers::statefulset_row,
+        WatchFilter { kind: "StatefulSet", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1714,13 +1718,17 @@ pub async fn create_statefulset(
     if ss.metadata.namespace.is_none() {
         ss.metadata.namespace = Some(namespace.clone());
     }
+    let ss_name = ss.metadata.name.clone().unwrap_or_default();
     tracing::info!(
         "api: create statefulset {}/{} replicas={}",
         namespace,
-        ss.metadata.name.clone().unwrap_or_default(),
+        ss_name,
         ss.spec.replicas.unwrap_or(1)
     );
     let created = StatefulSetRepository::create(&state.pool, &ss).await?;
+    state
+        .bus
+        .publish_added("StatefulSet", Some(&namespace), &ss_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1735,9 +1743,13 @@ pub async fn update_statefulset(
         name,
         ss.spec.replicas.unwrap_or(1)
     );
-    ss.metadata.namespace = Some(namespace);
-    ss.metadata.name = Some(name);
-    Ok(Json(StatefulSetRepository::create(&state.pool, &ss).await?))
+    ss.metadata.namespace = Some(namespace.clone());
+    ss.metadata.name = Some(name.clone());
+    let updated = StatefulSetRepository::create(&state.pool, &ss).await?;
+    state
+        .bus
+        .publish_modified("StatefulSet", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_statefulset(
@@ -1746,11 +1758,12 @@ pub async fn delete_statefulset(
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete statefulset {}/{}", namespace, name);
     // Best-effort: also delete the owned pods.
-    if let Ok(ss) = StatefulSetRepository::get(&state.pool, &namespace, &name).await {
+    let ss_pre = StatefulSetRepository::get(&state.pool, &namespace, &name).await.ok();
+    if let Some(ss) = &ss_pre {
         if let Some(selector) = &ss.spec.selector.match_labels {
             if let Ok(pods) = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await {
                 for pod in pods {
-                    if let Some(pod_name) = pod.metadata.name {
+                    if let Some(pod_name) = pod.metadata.name.clone() {
                         tracing::info!(
                             "api: cascading delete pod {}/{} owned by statefulset {}",
                             namespace,
@@ -1758,12 +1771,20 @@ pub async fn delete_statefulset(
                             name
                         );
                         let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
+                        state
+                            .bus
+                            .publish_deleted("Pod", Some(&namespace), &pod_name, &pod);
                     }
                 }
             }
         }
     }
     StatefulSetRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(ss) = ss_pre {
+        state
+            .bus
+            .publish_deleted("StatefulSet", Some(&namespace), &name, &ss);
+    }
     Ok(Json(json!({
         "apiVersion": "v1", "kind": "Status", "metadata": {}, "status": "Success",
         "details": {"name": name, "group": "apps", "kind": "statefulsets"}
@@ -1780,13 +1801,15 @@ pub async fn list_daemonsets(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = DaemonSetRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "apps/v1",
         "DaemonSetList",
         items,
         printers::DAEMONSET_COLUMNS,
         printers::daemonset_row,
+        WatchFilter { kind: "DaemonSet", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -1795,13 +1818,15 @@ pub async fn list_all_daemonsets(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = DaemonSetRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers,
         "apps/v1",
         "DaemonSetList",
         items,
         printers::DAEMONSET_COLUMNS,
         printers::daemonset_row,
+        WatchFilter { kind: "DaemonSet", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1827,12 +1852,12 @@ pub async fn create_daemonset(
     if ds.metadata.namespace.is_none() {
         ds.metadata.namespace = Some(namespace.clone());
     }
-    tracing::info!(
-        "api: create daemonset {}/{}",
-        namespace,
-        ds.metadata.name.clone().unwrap_or_default()
-    );
+    let ds_name = ds.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create daemonset {}/{}", namespace, ds_name);
     let created = DaemonSetRepository::create(&state.pool, &ds).await?;
+    state
+        .bus
+        .publish_added("DaemonSet", Some(&namespace), &ds_name, &created);
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -1842,9 +1867,13 @@ pub async fn update_daemonset(
     Json(mut ds): Json<DaemonSet>,
 ) -> Result<Json<DaemonSet>> {
     tracing::info!("api: update daemonset {}/{}", namespace, name);
-    ds.metadata.namespace = Some(namespace);
-    ds.metadata.name = Some(name);
-    Ok(Json(DaemonSetRepository::create(&state.pool, &ds).await?))
+    ds.metadata.namespace = Some(namespace.clone());
+    ds.metadata.name = Some(name.clone());
+    let updated = DaemonSetRepository::create(&state.pool, &ds).await?;
+    state
+        .bus
+        .publish_modified("DaemonSet", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_daemonset(
@@ -1852,11 +1881,12 @@ pub async fn delete_daemonset(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete daemonset {}/{}", namespace, name);
-    if let Ok(ds) = DaemonSetRepository::get(&state.pool, &namespace, &name).await {
+    let ds_pre = DaemonSetRepository::get(&state.pool, &namespace, &name).await.ok();
+    if let Some(ds) = &ds_pre {
         if let Some(selector) = &ds.spec.selector.match_labels {
             if let Ok(pods) = PodRepository::list(&state.pool, Some(&namespace), Some(selector)).await {
                 for pod in pods {
-                    if let Some(pod_name) = pod.metadata.name {
+                    if let Some(pod_name) = pod.metadata.name.clone() {
                         tracing::info!(
                             "api: cascading delete pod {}/{} owned by daemonset {}",
                             namespace,
@@ -1864,12 +1894,20 @@ pub async fn delete_daemonset(
                             name
                         );
                         let _ = PodRepository::delete(&state.pool, &namespace, &pod_name).await;
+                        state
+                            .bus
+                            .publish_deleted("Pod", Some(&namespace), &pod_name, &pod);
                     }
                 }
             }
         }
     }
     DaemonSetRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(ds) = ds_pre {
+        state
+            .bus
+            .publish_deleted("DaemonSet", Some(&namespace), &name, &ds);
+    }
     Ok(Json(json!({
         "apiVersion": "v1", "kind": "Status", "metadata": {}, "status": "Success",
         "details": {"name": name, "group": "apps", "kind": "daemonsets"}
@@ -1886,9 +1924,11 @@ pub async fn list_service_accounts(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = ServiceAccountRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers, "v1", "ServiceAccountList", items,
         printers::SERVICEACCOUNT_COLUMNS, printers::serviceaccount_row,
+        WatchFilter { kind: "ServiceAccount", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -1897,9 +1937,11 @@ pub async fn list_all_service_accounts(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = ServiceAccountRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers, "v1", "ServiceAccountList", items,
         printers::SERVICEACCOUNT_COLUMNS, printers::serviceaccount_row,
+        WatchFilter { kind: "ServiceAccount", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -1918,12 +1960,13 @@ pub async fn create_service_account(
     Json(mut sa): Json<ServiceAccount>,
 ) -> Result<(StatusCode, Json<ServiceAccount>)> {
     if sa.metadata.namespace.is_none() { sa.metadata.namespace = Some(namespace.clone()); }
-    tracing::info!(
-        "api: create serviceaccount {}/{}",
-        namespace,
-        sa.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(ServiceAccountRepository::create(&state.pool, &sa).await?)))
+    let sa_name = sa.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create serviceaccount {}/{}", namespace, sa_name);
+    let created = ServiceAccountRepository::create(&state.pool, &sa).await?;
+    state
+        .bus
+        .publish_added("ServiceAccount", Some(&namespace), &sa_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_service_account(
@@ -1932,9 +1975,13 @@ pub async fn update_service_account(
     Json(mut sa): Json<ServiceAccount>,
 ) -> Result<Json<ServiceAccount>> {
     tracing::info!("api: update serviceaccount {}/{}", namespace, name);
-    sa.metadata.namespace = Some(namespace);
-    sa.metadata.name = Some(name);
-    Ok(Json(ServiceAccountRepository::create(&state.pool, &sa).await?))
+    sa.metadata.namespace = Some(namespace.clone());
+    sa.metadata.name = Some(name.clone());
+    let updated = ServiceAccountRepository::create(&state.pool, &sa).await?;
+    state
+        .bus
+        .publish_modified("ServiceAccount", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_service_account(
@@ -1942,7 +1989,13 @@ pub async fn delete_service_account(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete serviceaccount {}/{}", namespace, name);
+    let pre = ServiceAccountRepository::get(&state.pool, &namespace, &name).await.ok();
     ServiceAccountRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("ServiceAccount", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "kind":"serviceaccounts"}})))
 }
@@ -1957,8 +2010,10 @@ pub async fn list_secrets(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = SecretRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(&headers, "v1", "SecretList", items,
-        printers::SECRET_COLUMNS, printers::secret_row))
+    Ok(table::list_response_live(&headers, "v1", "SecretList", items,
+        printers::SECRET_COLUMNS, printers::secret_row,
+        WatchFilter { kind: "Secret", namespace: Some(namespace) },
+        &state.bus))
 }
 
 pub async fn list_all_secrets(
@@ -1966,8 +2021,10 @@ pub async fn list_all_secrets(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = SecretRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(&headers, "v1", "SecretList", items,
-        printers::SECRET_COLUMNS, printers::secret_row))
+    Ok(table::list_response_live(&headers, "v1", "SecretList", items,
+        printers::SECRET_COLUMNS, printers::secret_row,
+        WatchFilter { kind: "Secret", namespace: None },
+        &state.bus))
 }
 
 pub async fn get_secret(
@@ -1985,12 +2042,13 @@ pub async fn create_secret(
     Json(mut s): Json<Secret>,
 ) -> Result<(StatusCode, Json<Secret>)> {
     if s.metadata.namespace.is_none() { s.metadata.namespace = Some(namespace.clone()); }
-    tracing::info!(
-        "api: create secret {}/{}",
-        namespace,
-        s.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(SecretRepository::create(&state.pool, &s).await?)))
+    let secret_name = s.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create secret {}/{}", namespace, secret_name);
+    let created = SecretRepository::create(&state.pool, &s).await?;
+    state
+        .bus
+        .publish_added("Secret", Some(&namespace), &secret_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_secret(
@@ -1999,9 +2057,13 @@ pub async fn update_secret(
     Json(mut s): Json<Secret>,
 ) -> Result<Json<Secret>> {
     tracing::info!("api: update secret {}/{}", namespace, name);
-    s.metadata.namespace = Some(namespace);
-    s.metadata.name = Some(name);
-    Ok(Json(SecretRepository::create(&state.pool, &s).await?))
+    s.metadata.namespace = Some(namespace.clone());
+    s.metadata.name = Some(name.clone());
+    let updated = SecretRepository::create(&state.pool, &s).await?;
+    state
+        .bus
+        .publish_modified("Secret", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_secret(
@@ -2009,7 +2071,13 @@ pub async fn delete_secret(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete secret {}/{}", namespace, name);
+    let pre = SecretRepository::get(&state.pool, &namespace, &name).await.ok();
     SecretRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("Secret", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "kind":"secrets"}})))
 }
@@ -2024,8 +2092,10 @@ pub async fn list_config_maps(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = ConfigMapRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(&headers, "v1", "ConfigMapList", items,
-        printers::CONFIGMAP_COLUMNS, printers::configmap_row))
+    Ok(table::list_response_live(&headers, "v1", "ConfigMapList", items,
+        printers::CONFIGMAP_COLUMNS, printers::configmap_row,
+        WatchFilter { kind: "ConfigMap", namespace: Some(namespace) },
+        &state.bus))
 }
 
 pub async fn list_all_config_maps(
@@ -2033,8 +2103,10 @@ pub async fn list_all_config_maps(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = ConfigMapRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(&headers, "v1", "ConfigMapList", items,
-        printers::CONFIGMAP_COLUMNS, printers::configmap_row))
+    Ok(table::list_response_live(&headers, "v1", "ConfigMapList", items,
+        printers::CONFIGMAP_COLUMNS, printers::configmap_row,
+        WatchFilter { kind: "ConfigMap", namespace: None },
+        &state.bus))
 }
 
 pub async fn get_config_map(
@@ -2052,12 +2124,13 @@ pub async fn create_config_map(
     Json(mut cm): Json<ConfigMap>,
 ) -> Result<(StatusCode, Json<ConfigMap>)> {
     if cm.metadata.namespace.is_none() { cm.metadata.namespace = Some(namespace.clone()); }
-    tracing::info!(
-        "api: create configmap {}/{}",
-        namespace,
-        cm.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(ConfigMapRepository::create(&state.pool, &cm).await?)))
+    let cm_name = cm.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create configmap {}/{}", namespace, cm_name);
+    let created = ConfigMapRepository::create(&state.pool, &cm).await?;
+    state
+        .bus
+        .publish_added("ConfigMap", Some(&namespace), &cm_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_config_map(
@@ -2066,9 +2139,13 @@ pub async fn update_config_map(
     Json(mut cm): Json<ConfigMap>,
 ) -> Result<Json<ConfigMap>> {
     tracing::info!("api: update configmap {}/{}", namespace, name);
-    cm.metadata.namespace = Some(namespace);
-    cm.metadata.name = Some(name);
-    Ok(Json(ConfigMapRepository::create(&state.pool, &cm).await?))
+    cm.metadata.namespace = Some(namespace.clone());
+    cm.metadata.name = Some(name.clone());
+    let updated = ConfigMapRepository::create(&state.pool, &cm).await?;
+    state
+        .bus
+        .publish_modified("ConfigMap", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_config_map(
@@ -2076,7 +2153,13 @@ pub async fn delete_config_map(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete configmap {}/{}", namespace, name);
+    let pre = ConfigMapRepository::get(&state.pool, &namespace, &name).await.ok();
     ConfigMapRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("ConfigMap", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "kind":"configmaps"}})))
 }
@@ -2090,8 +2173,10 @@ pub async fn list_cluster_roles(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = ClusterRoleRepository::list(&state.pool).await?;
-    Ok(table::list_response(&headers, "rbac.authorization.k8s.io/v1", "ClusterRoleList", items,
-        printers::CLUSTERROLE_COLUMNS, printers::clusterrole_row))
+    Ok(table::list_response_live(&headers, "rbac.authorization.k8s.io/v1", "ClusterRoleList", items,
+        printers::CLUSTERROLE_COLUMNS, printers::clusterrole_row,
+        WatchFilter { kind: "ClusterRole", namespace: None },
+        &state.bus))
 }
 
 pub async fn get_cluster_role(
@@ -2107,11 +2192,13 @@ pub async fn create_cluster_role(
     State(state): State<Arc<AppState>>,
     Json(cr): Json<ClusterRole>,
 ) -> Result<(StatusCode, Json<ClusterRole>)> {
-    tracing::info!(
-        "api: create clusterrole {}",
-        cr.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(ClusterRoleRepository::create(&state.pool, &cr).await?)))
+    let cr_name = cr.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create clusterrole {}", cr_name);
+    let created = ClusterRoleRepository::create(&state.pool, &cr).await?;
+    state
+        .bus
+        .publish_added("ClusterRole", None, &cr_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_cluster_role(
@@ -2120,8 +2207,12 @@ pub async fn update_cluster_role(
     Json(mut cr): Json<ClusterRole>,
 ) -> Result<Json<ClusterRole>> {
     tracing::info!("api: update clusterrole {}", name);
-    cr.metadata.name = Some(name);
-    Ok(Json(ClusterRoleRepository::create(&state.pool, &cr).await?))
+    cr.metadata.name = Some(name.clone());
+    let updated = ClusterRoleRepository::create(&state.pool, &cr).await?;
+    state
+        .bus
+        .publish_modified("ClusterRole", None, &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_cluster_role(
@@ -2129,7 +2220,13 @@ pub async fn delete_cluster_role(
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete clusterrole {}", name);
+    let pre = ClusterRoleRepository::get(&state.pool, &name).await.ok();
     ClusterRoleRepository::delete(&state.pool, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("ClusterRole", None, &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"clusterroles"}})))
 }
@@ -2143,8 +2240,10 @@ pub async fn list_cluster_role_bindings(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = ClusterRoleBindingRepository::list(&state.pool).await?;
-    Ok(table::list_response(&headers, "rbac.authorization.k8s.io/v1", "ClusterRoleBindingList", items,
-        printers::CLUSTERROLEBINDING_COLUMNS, printers::clusterrolebinding_row))
+    Ok(table::list_response_live(&headers, "rbac.authorization.k8s.io/v1", "ClusterRoleBindingList", items,
+        printers::CLUSTERROLEBINDING_COLUMNS, printers::clusterrolebinding_row,
+        WatchFilter { kind: "ClusterRoleBinding", namespace: None },
+        &state.bus))
 }
 
 pub async fn get_cluster_role_binding(
@@ -2160,11 +2259,13 @@ pub async fn create_cluster_role_binding(
     State(state): State<Arc<AppState>>,
     Json(b): Json<ClusterRoleBinding>,
 ) -> Result<(StatusCode, Json<ClusterRoleBinding>)> {
-    tracing::info!(
-        "api: create clusterrolebinding {}",
-        b.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(ClusterRoleBindingRepository::create(&state.pool, &b).await?)))
+    let crb_name = b.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create clusterrolebinding {}", crb_name);
+    let created = ClusterRoleBindingRepository::create(&state.pool, &b).await?;
+    state
+        .bus
+        .publish_added("ClusterRoleBinding", None, &crb_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_cluster_role_binding(
@@ -2173,8 +2274,12 @@ pub async fn update_cluster_role_binding(
     Json(mut b): Json<ClusterRoleBinding>,
 ) -> Result<Json<ClusterRoleBinding>> {
     tracing::info!("api: update clusterrolebinding {}", name);
-    b.metadata.name = Some(name);
-    Ok(Json(ClusterRoleBindingRepository::create(&state.pool, &b).await?))
+    b.metadata.name = Some(name.clone());
+    let updated = ClusterRoleBindingRepository::create(&state.pool, &b).await?;
+    state
+        .bus
+        .publish_modified("ClusterRoleBinding", None, &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_cluster_role_binding(
@@ -2182,7 +2287,13 @@ pub async fn delete_cluster_role_binding(
     Path(name): Path<String>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete clusterrolebinding {}", name);
+    let pre = ClusterRoleBindingRepository::get(&state.pool, &name).await.ok();
     ClusterRoleBindingRepository::delete(&state.pool, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("ClusterRoleBinding", None, &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"clusterrolebindings"}})))
 }
@@ -2301,9 +2412,11 @@ pub async fn list_roles(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = RoleRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers, "rbac.authorization.k8s.io/v1", "RoleList", items,
         printers::ROLE_COLUMNS, printers::role_row,
+        WatchFilter { kind: "Role", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -2312,9 +2425,11 @@ pub async fn list_all_roles(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = RoleRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers, "rbac.authorization.k8s.io/v1", "RoleList", items,
         printers::ROLE_COLUMNS, printers::role_row,
+        WatchFilter { kind: "Role", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -2333,12 +2448,13 @@ pub async fn create_role(
     Json(mut r): Json<Role>,
 ) -> Result<(StatusCode, Json<Role>)> {
     if r.metadata.namespace.is_none() { r.metadata.namespace = Some(namespace.clone()); }
-    tracing::info!(
-        "api: create role {}/{}",
-        namespace,
-        r.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(RoleRepository::create(&state.pool, &r).await?)))
+    let role_name = r.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create role {}/{}", namespace, role_name);
+    let created = RoleRepository::create(&state.pool, &r).await?;
+    state
+        .bus
+        .publish_added("Role", Some(&namespace), &role_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_role(
@@ -2347,9 +2463,13 @@ pub async fn update_role(
     Json(mut r): Json<Role>,
 ) -> Result<Json<Role>> {
     tracing::info!("api: update role {}/{}", namespace, name);
-    r.metadata.namespace = Some(namespace);
-    r.metadata.name = Some(name);
-    Ok(Json(RoleRepository::create(&state.pool, &r).await?))
+    r.metadata.namespace = Some(namespace.clone());
+    r.metadata.name = Some(name.clone());
+    let updated = RoleRepository::create(&state.pool, &r).await?;
+    state
+        .bus
+        .publish_modified("Role", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_role(
@@ -2357,7 +2477,13 @@ pub async fn delete_role(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete role {}/{}", namespace, name);
+    let pre = RoleRepository::get(&state.pool, &namespace, &name).await.ok();
     RoleRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("Role", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"roles"}})))
 }
@@ -2372,9 +2498,11 @@ pub async fn list_role_bindings(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = RoleBindingRepository::list(&state.pool, Some(&namespace)).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers, "rbac.authorization.k8s.io/v1", "RoleBindingList", items,
         printers::ROLEBINDING_COLUMNS, printers::rolebinding_row,
+        WatchFilter { kind: "RoleBinding", namespace: Some(namespace) },
+        &state.bus,
     ))
 }
 
@@ -2383,9 +2511,11 @@ pub async fn list_all_role_bindings(
     headers: HeaderMap,
 ) -> Result<Response> {
     let items = RoleBindingRepository::list(&state.pool, None).await?;
-    Ok(table::list_response(
+    Ok(table::list_response_live(
         &headers, "rbac.authorization.k8s.io/v1", "RoleBindingList", items,
         printers::ROLEBINDING_COLUMNS, printers::rolebinding_row,
+        WatchFilter { kind: "RoleBinding", namespace: None },
+        &state.bus,
     ))
 }
 
@@ -2404,12 +2534,13 @@ pub async fn create_role_binding(
     Json(mut b): Json<RoleBinding>,
 ) -> Result<(StatusCode, Json<RoleBinding>)> {
     if b.metadata.namespace.is_none() { b.metadata.namespace = Some(namespace.clone()); }
-    tracing::info!(
-        "api: create rolebinding {}/{}",
-        namespace,
-        b.metadata.name.clone().unwrap_or_default()
-    );
-    Ok((StatusCode::CREATED, Json(RoleBindingRepository::create(&state.pool, &b).await?)))
+    let rb_name = b.metadata.name.clone().unwrap_or_default();
+    tracing::info!("api: create rolebinding {}/{}", namespace, rb_name);
+    let created = RoleBindingRepository::create(&state.pool, &b).await?;
+    state
+        .bus
+        .publish_added("RoleBinding", Some(&namespace), &rb_name, &created);
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_role_binding(
@@ -2418,9 +2549,13 @@ pub async fn update_role_binding(
     Json(mut b): Json<RoleBinding>,
 ) -> Result<Json<RoleBinding>> {
     tracing::info!("api: update rolebinding {}/{}", namespace, name);
-    b.metadata.namespace = Some(namespace);
-    b.metadata.name = Some(name);
-    Ok(Json(RoleBindingRepository::create(&state.pool, &b).await?))
+    b.metadata.namespace = Some(namespace.clone());
+    b.metadata.name = Some(name.clone());
+    let updated = RoleBindingRepository::create(&state.pool, &b).await?;
+    state
+        .bus
+        .publish_modified("RoleBinding", Some(&namespace), &name, &updated);
+    Ok(Json(updated))
 }
 
 pub async fn delete_role_binding(
@@ -2428,7 +2563,13 @@ pub async fn delete_role_binding(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
     tracing::info!("api: delete rolebinding {}/{}", namespace, name);
+    let pre = RoleBindingRepository::get(&state.pool, &namespace, &name).await.ok();
     RoleBindingRepository::delete(&state.pool, &namespace, &name).await?;
+    if let Some(obj) = pre {
+        state
+            .bus
+            .publish_deleted("RoleBinding", Some(&namespace), &name, &obj);
+    }
     Ok(Json(json!({"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success",
         "details":{"name": name, "group":"rbac.authorization.k8s.io", "kind":"rolebindings"}})))
 }
