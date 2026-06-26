@@ -861,7 +861,14 @@ async fn handle_exec_websocket(
                         break;
                     }
                 }
-                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(Message::Close(_)) => {
+                    // kubectl-initiated exit: forward the close to the node so
+                    // it tears down the exec session cleanly instead of
+                    // waiting on a raw EOF.
+                    let _ = node_write.send(TungsteniteMessage::Close(None)).await;
+                    break;
+                }
+                Err(_) => break,
                 _ => {}
             }
         }
@@ -888,7 +895,19 @@ async fn handle_exec_websocket(
                         break;
                     }
                 }
-                Ok(TungsteniteMessage::Close(_)) | Err(_) => break,
+                Ok(TungsteniteMessage::Close(_)) => {
+                    // The agent finished and closed cleanly. Forward a normal
+                    // close so kubectl sees a clean EOF on the error stream
+                    // instead of `close 1006 (abnormal closure)`.
+                    let _ = client_write
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1000,
+                            reason: std::borrow::Cow::Borrowed("exec complete"),
+                        })))
+                        .await;
+                    break;
+                }
+                Err(_) => break,
                 _ => {}
             }
         }
