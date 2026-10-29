@@ -3,15 +3,20 @@
 # Multi-stage build for superkube.
 #
 #   docker build -t superkube:dev .
-#   docker run --rm -p 6443:6443 -v superkube-data:/var/lib/superkube superkube:dev
+#   docker run --rm --privileged -p 6443:6443 -p 30080:30080 \
+#       -v superkube-data:/var/lib/superkube superkube:dev
 #
 # Notes:
-#   - On Linux the binary's `docker` runtime backend is compiled out (bollard
-#     is gated to target_os = "macos"). Inside the container, `--runtime=auto`
-#     resolves to `embedded` (libcontainer) — which currently lacks pod
-#     networking, so this image is best used as the API server / control plane
-#     while node agents run on the host. Mount /var/run/docker.sock and use
-#     `--runtime=mock` only for tests.
+#   - Inside the container `--runtime=auto` resolves to `embedded`
+#     (libcontainer), so pods run *inside this container*, kind-style. That
+#     needs `--privileged` (namespaces, cgroups, mounts, the pod bridge) and
+#     a real volume at /var/lib/superkube: overlayfs can't put its upper
+#     layer on Docker's own overlay, so without a volume every pod rootfs is
+#     copied instead of overlaid. Publish the NodePorts you use (or run with
+#     `--network host` on Linux to get them, and the pod bridge, on the host).
+#   - The `docker` runtime backend is compiled out on Linux (bollard is
+#     gated to macOS). `--runtime=mock` works for API-only tests and needs
+#     neither `--privileged` nor root.
 #   - The image targets glibc (debian-slim). For a static, distroless image,
 #     build with the musl target outside Docker and `COPY` the binary in.
 
@@ -29,12 +34,10 @@ ARG KUBECTL_VERSION=v1.32.0
 # ----------------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
 
-# libseccomp-dev: required by libcontainer (Linux-only dep).
 # libssl-dev / pkg-config: reqwest's default tls = native-tls = OpenSSL.
-# protobuf-compiler: containerd-client's build.rs invokes `protoc` to generate
-# gRPC bindings.
+# (libcontainer is built without its seccomp feature, so no libseccomp-dev.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libseccomp-dev pkg-config libssl-dev protobuf-compiler \
+        pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -63,9 +66,10 @@ ARG KUBECTL_VERSION
 ARG TARGETARCH
 
 # Install runtime deps + kubectl in one layer. curl is removed at the end since
-# it was only pulled in to download kubectl.
+# it was only pulled in to download kubectl. iptables is for the embedded
+# runtime's pod-egress MASQUERADE rule.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libseccomp2 libssl3 tini curl \
+        ca-certificates libssl3 iptables tini curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 superkube \
     && useradd  --system --uid 1000 --gid superkube \
@@ -111,7 +115,9 @@ ENV KUBECONFIG=/var/lib/superkube/.kube/config
 EXPOSE 6443 10250
 
 WORKDIR /var/lib/superkube
-USER superkube
+# Root: the embedded runtime creates namespaces, cgroups, mounts, and the pod
+# bridge. The `superkube` user is kept for API-only runs (`--user superkube`
+# with `--runtime=mock`).
 VOLUME ["/var/lib/superkube"]
 
 # tini reaps zombies and forwards SIGTERM cleanly to the Rust process.

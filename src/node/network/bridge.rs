@@ -40,14 +40,15 @@ pub async fn ensure_bridge(handle: &Handle, gateway: Ipv4Addr) -> Result<u32> {
 
 pub(super) async fn link_index_by_name(handle: &Handle, name: &str) -> Result<Option<u32>> {
     let mut links = handle.link().get().match_name(name.to_string()).execute();
-    if let Some(link) = links
-        .try_next()
-        .await
-        .with_context(|| format!("link.get({name})"))?
-    {
-        return Ok(Some(link.header.index));
+    match links.try_next().await {
+        Ok(Some(link)) => Ok(Some(link.header.index)),
+        Ok(None) => Ok(None),
+        // The kernel answers a by-name lookup of a link that doesn't exist
+        // with ENODEV rather than an empty dump — that's "not found", not a
+        // failure.
+        Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -nix::libc::ENODEV => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("link.get({name})")),
     }
-    Ok(None)
 }
 
 async fn ensure_address(

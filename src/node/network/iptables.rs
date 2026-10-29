@@ -5,7 +5,7 @@
 //! shell out rather than pull in a netfilter crate; the rule set is tiny and
 //! `iptables` is universally available on Linux hosts.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -32,9 +32,15 @@ pub fn ensure_masquerade(pod_cidr: &str) -> Result<()> {
 }
 
 fn install(table: &str, chain: &str, rule: &[&str]) -> Result<()> {
-    // `-C` returns 0 if the rule already exists, non-zero otherwise.
+    // `-C` returns 0 if the rule already exists, non-zero otherwise — and
+    // prints "Bad rule" to stderr for the latter, which is the expected
+    // first-run outcome, not something for the log.
     let mut check = Command::new("iptables");
-    check.args(["-t", table, "-C", chain]).args(rule);
+    check
+        .args(["-t", table, "-C", chain])
+        .args(rule)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if let Ok(status) = check.status() {
         if status.success() {
             return Ok(());

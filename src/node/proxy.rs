@@ -2,8 +2,11 @@
 //!
 //! Periodically fetches all NodePort services from the API. For each one,
 //! ensures a TCP listener is running on `0.0.0.0:<nodePort>`. Connections that
-//! land on that listener are forwarded to a backing pod's published host port
-//! (which the agent records in `pod_ports` whenever it observes a container).
+//! land on that listener are forwarded to a backing pod on this node: to the
+//! host port its runtime published (Docker — the agent records those in
+//! `pod_ports`), or, when nothing is published, straight to the pod IP the
+//! agent recorded in `pod_ips` (the embedded runtime, whose bridge the host
+//! can route to directly).
 //!
 //! This is single-host friendly: only pods running on *this* node can be
 //! reached via the local proxy. In a multi-node cluster, every node would run
@@ -201,24 +204,31 @@ async fn handle_conn(
         anyhow::bail!("no endpoints for service");
     }
 
-    // Pick the first endpoint whose pod is local + has a published host port
-    // for `target_port`.
+    // Pick the first local endpoint we can reach: a runtime-published host
+    // port for `target_port` if there is one, else the pod IP itself.
     let agent_state = state.read().await;
-    let host_port = candidates.iter().find_map(|(ns, pod)| {
-        let mappings = agent_state.pod_ports.get(&(ns.clone(), pod.clone()))?;
-        mappings
-            .iter()
-            .find(|m| m.container_port == target_port && m.protocol == "tcp")
-            .map(|m| m.host_port)
+    let backend = candidates.iter().find_map(|(ns, pod)| {
+        let key = (ns.clone(), pod.clone());
+        if let Some(m) = agent_state.pod_ports.get(&key).and_then(|mappings| {
+            mappings
+                .iter()
+                .find(|m| m.container_port == target_port && m.protocol == "tcp")
+        }) {
+            return Some(("127.0.0.1".to_string(), m.host_port));
+        }
+        agent_state
+            .pod_ips
+            .get(&key)
+            .map(|ip| (ip.clone(), target_port as u16))
     });
     drop(agent_state);
 
-    let host_port = host_port.ok_or_else(|| {
-        anyhow::anyhow!("no local backend with published port {}", target_port)
+    let (host, port) = backend.ok_or_else(|| {
+        anyhow::anyhow!("no local backend for port {}", target_port)
     })?;
 
-    // Connect to localhost:<host_port> and bidi-pipe.
-    let backend = TcpStream::connect(("127.0.0.1", host_port)).await?;
+    // Connect to the backend and bidi-pipe.
+    let backend = TcpStream::connect((host.as_str(), port)).await?;
     let (mut cr, mut cw) = client.into_split();
     let (mut br, mut bw) = backend.into_split();
 

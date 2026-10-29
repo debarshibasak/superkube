@@ -384,10 +384,34 @@ impl Runtime for DockerRuntime {
                     })
                 });
 
+                // Exit code: Docker records it on the exec once the process
+                // has ended, which is when the attached stream closes. Poll
+                // briskly at first, then once a second for long sessions.
+                let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+                {
+                    let client = self.client.clone();
+                    let id = exec.id.clone();
+                    tokio::spawn(async move {
+                        for i in 0..86_400u32 {
+                            match client.inspect_exec(&id).await {
+                                Ok(info) if info.running == Some(false) => {
+                                    let _ = exit_tx.send(info.exit_code.unwrap_or(0) as i32);
+                                    return;
+                                }
+                                Ok(_) => {}
+                                Err(_) => return,
+                            }
+                            let delay = if i < 50 { 100 } else { 1000 };
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                    });
+                }
+
                 Ok(ExecSession {
                     output: Box::pin(mapped),
                     input,
                     resize,
+                    exit: Some(exit_rx),
                 })
             }
             StartExecResults::Detached => {

@@ -1,3 +1,5 @@
+use std::os::fd::AsFd;
+
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -51,8 +53,10 @@ enum Commands {
         #[arg(long, default_value = "/run/containerd/containerd.sock")]
         containerd_socket: String,
 
-        /// Container runtime backend used by the embedded node agent.
-        /// One of: `auto` (default), `docker`, `embedded`, `mock`, `wasm`.
+        /// Default container engine for the embedded node agent. One of:
+        /// `auto` (embedded on Linux, docker on macOS), `docker`, `embedded`,
+        /// `mock`, `wasm`. Pods pick another engine on the same node with
+        /// `spec.runtimeClassName`.
         #[arg(long, default_value = "auto")]
         runtime: String,
     },
@@ -71,8 +75,9 @@ enum Commands {
         #[arg(long, default_value = "/run/containerd/containerd.sock")]
         containerd_socket: String,
 
-        /// Container runtime backend. One of:
-        ///   `auto` (default), `docker`, `embedded`, `mock`, `wasm`.
+        /// Default container engine. One of: `auto` (embedded on Linux,
+        /// docker on macOS), `docker`, `embedded`, `mock`, `wasm`. Pods pick
+        /// another engine on the same node with `spec.runtimeClassName`.
         #[arg(long, default_value = "auto")]
         runtime: String,
     },
@@ -80,13 +85,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
+    // Initialize tracing. Log to a private dup of stderr rather than fd 2
+    // itself: on Linux the embedded runtime's cloned init process dup2s the
+    // container's stdio over fds 0-2 while it is still setting up, and
+    // anything libcontainer logs after that point would otherwise land in
+    // the container's log or in an exec session's terminal.
+    let log_sink = std::sync::Arc::new(std::fs::File::from(
+        std::io::stderr().as_fd().try_clone_to_owned()?,
+    ));
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "superkube=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "superkube=info,tower_http=info,libcgroups=error".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(log_sink))
         .init();
 
     let cli = Cli::parse();

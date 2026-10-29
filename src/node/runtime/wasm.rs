@@ -454,6 +454,7 @@ impl Runtime for WasmRuntime {
             input: Box::pin(stdin_client_write),
             // wasm has no terminal — resize is a no-op.
             resize: Box::new(|_, _| Box::pin(async { Ok(()) })),
+            exit: None,
         })
     }
 }

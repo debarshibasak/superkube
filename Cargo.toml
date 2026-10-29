@@ -111,7 +111,9 @@ libcontainer = { version = "0.5", default-features = false, features = ["v2", "s
 # Built-in mini-CNI: bridge + veth + IP setup via netlink, no host plugins.
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
-nix = { version = "0.29", features = ["sched", "fs", "mount", "process"] }
+# `signal` for kill(2) on container/exec pids, `socket` for receiving the
+# pty master libcontainer sends over the console socket (SCM_RIGHTS).
+nix = { version = "0.29", features = ["sched", "fs", "mount", "process", "signal", "socket"] }
 # OCI runtime spec types — only used by the Linux-only bundle generator
 # that feeds libcontainer.
 oci-spec = "0.7"

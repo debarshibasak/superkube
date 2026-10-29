@@ -13,7 +13,8 @@ PS: I am working towards making this platform production grade.
 
 ## What works
 
-- **kubectl-shaped API**: discovery, table responses, `cluster-info`, `get all`, `describe`, `logs -f`, `exec`, `port-forward`.
+- **kubectl-shaped API**: discovery, table responses, `cluster-info`, `get all`, `describe`, `logs -f`, `exec -it` (exit codes included). `port-forward` doesn't speak current kubectl's protocol — see caveats.
+- **Engines**: `embedded` (youki's libcontainer, in-process, no daemon — the default on Linux), `docker` (macOS), `wasm` (any OS). All run side by side on one node; a pod picks one with `spec.runtimeClassName`.
 - **Workloads**: Pods, Deployments, StatefulSets, DaemonSets — each with their own controller loop.
 - **Networking**: Services (ClusterIP, NodePort, LoadBalancer), Endpoints; a userspace NodePort proxy on every node forwards to local pods.
 - **Configuration**: ServiceAccount, Secret, ConfigMap.
@@ -22,7 +23,7 @@ PS: I am working towards making this platform production grade.
 - **Observability**: Events emitted by the controllers, scheduler, and node agent.
 - **Storage**: SQLite (default, zero-setup) or PostgreSQL — same schema, picked by `--db-url`.
 
-Most of `kubectl get/apply/delete/describe/logs/exec/port-forward/cluster-info` works against this server with stock `kubectl`.
+Most of `kubectl get/apply/delete/describe/logs/exec/cluster-info` works against this server with stock `kubectl`.
 
 ## Architecture
 
@@ -124,7 +125,7 @@ How dispatch works:
 - Rust 1.88+ (transitive deps: `home` ≥0.5.12 needs 1.88, `base64ct` ≥1.8 needs `edition2024`/1.85)
 - One of:
     - **macOS**: Docker Desktop running (the embedded node agent talks to its socket)
-    - **Linux**: a kernel with cgroups v2 + namespaces (any modern distro); `libseccomp` headers if you build with seccomp enabled
+    - **Linux**: cgroups v2 (any modern distro), `iptables` on `PATH`, and root — the embedded engine creates namespaces, cgroups, overlay mounts, and a bridge. No Docker, containerd, or runc needed.
 - `kubectl` ≥1.27 if you want to drive it
 
 ### Build and run
@@ -326,7 +327,7 @@ curl http://localhost:31080/   # NodePort proxy → real nginx
 
 ### Cross-compiling for Linux from macOS
 
-If you develop on a Mac but want a binary that runs on a Linux node, cross-compile with `cross` (recommended — it runs the build inside a Linux container, so glibc, OpenSSL, and `libseccomp` headers are sorted out for you):
+If you develop on a Mac but want a binary that runs on a Linux node, cross-compile with `cross` (recommended — it runs the build inside a Linux container, so glibc and OpenSSL headers are sorted out for you):
 
 ```bash
 # one-time setup
@@ -357,7 +358,7 @@ CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
 Notes:
 
 - The `embedded` runtime (libcontainer) only compiles on Linux, so cross-compilation is the only way to produce that variant from a Mac. The `docker` runtime cross-compiles cleanly either way.
-- `seccomp` requires `libseccomp` headers in the build environment. `cross`'s default image already has them; for raw `cargo build` against musl, either disable the seccomp feature or install `libseccomp-dev` into the toolchain sysroot.
+- libcontainer is built without its seccomp feature, so no `libseccomp` headers are needed (and no seccomp profile is applied to pods — see caveats).
 - Apple Silicon → x86_64 Linux works via `cross` (it runs an amd64 container under QEMU emulation in Docker Desktop). It's slow but reliable; prefer `aarch64-unknown-linux-gnu` if your target Linux box is ARM.
 
 ### Adding more nodes (multi-host)
@@ -442,20 +443,43 @@ Server boots the API + an embedded node agent that registers the host as the con
 |------|---------|-------|
 | `--server` | — required | URL of the superkube control plane |
 | `--name` | host's short hostname | Node name |
-| `--runtime` | `auto` | `auto` / `docker` / `embedded` / `mock` |
+| `--runtime` | `auto` | `auto` / `docker` / `embedded` / `wasm` / `mock` — the node's *default* engine; pods override with `spec.runtimeClassName` |
 | `--containerd-socket` | `/run/containerd/containerd.sock` | only used by the mock runtime placeholder |
 
 `--runtime=auto` picks Docker on macOS, the embedded libcontainer runtime on Linux, otherwise the mock.
 
 ## Container runtimes
 
-| Backend | Where | What it talks to | Status |
-|---------|-------|------------------|--------|
-| `docker` | macOS, Linux | `/var/run/docker.sock` via `bollard` | Production-ready: pull / create / start / inspect / logs (live stream) / exec / port publishing for NodePort. |
-| `embedded` | Linux only | youki's `libcontainer` crate, in-process | Skeleton: image pull (`oci-distribution`) → bundle build (our `oci/bundle.rs`) → `libcontainer::ContainerBuilder.start()`. **TODO:** networking (no veth/bridge yet), log capture, exec. |
+| Engine | Where | What it talks to | Status |
+|--------|-------|------------------|--------|
+| `embedded` | Linux (default) | youki's `libcontainer` crate, in-process | Pull (`oci-distribution`) → per-container overlayfs rootfs → OCI bundle → libcontainer (namespaces, cgroups v2, pivot_root, Docker's default capability set). Own mini-CNI: `superkube0` bridge, veth per container, MASQUERADE egress. Logs captured to `/var/lib/superkube/logs` with live `-f`; `exec` with pipes or a real pty (allocated in the container's devpts, controlling tty set); real exit codes via `waitpid`; stop/cleanup on pod delete. |
+| `docker` | macOS (default) | `/var/run/docker.sock` via `bollard` | Pull / create / start / inspect / logs (live stream) / exec (with exit code) / port publishing for NodePort. |
+| `wasm` | any | wasmtime, linked in | WASI modules by OCI reference or path; logs, exec, inetd-style ports. |
 | `mock` | any | nothing | In-memory stub for tests / dev without a runtime. |
 
-The embedded path is the answer to "single static binary, no host daemon" on Linux: `superkube node --runtime=embedded` pulls images itself and hands the OCI bundle to libcontainer for namespaces / cgroups v2 / pivot_root.
+A node runs every engine it can construct, and `--runtime=` only picks the default. A pod chooses another one with the standard field:
+
+```yaml
+spec:
+  runtimeClassName: wasm   # embedded | docker | wasm | mock
+```
+
+The embedded path is the answer to "single binary, no host daemon" on Linux: `superkube server` pulls images itself and hands the OCI bundle to libcontainer. State lives under `/var/lib/superkube` (`images/`, `bundles/`, `state/`, `logs/`). NodePort traffic and `exec` reach pods through their bridge IPs, so nothing is published to host ports.
+
+### Running superkube inside a container
+
+The Linux build runs kind-style inside a privileged container, pods and all — which is also how a Mac gets the embedded engine (Docker/Colima then hosts superkube itself, not the pods):
+
+```bash
+docker build -t superkube:dev .
+docker run -d --name superkube --privileged \
+  -p 6443:6443 -p 30080:30080 \
+  -v superkube-data:/var/lib/superkube \
+  superkube:dev
+kubectl --server=http://localhost:6443 get nodes
+```
+
+`--privileged` is for the namespaces, cgroups, mounts, and the pod bridge. The volume matters: overlayfs can't stack its upper layer on Docker's overlay2, so without one every pod rootfs is copied instead (works, just slower). On Linux, `--network host` puts the bridge and NodePorts on the host directly. At startup the runtime moves itself out of the cgroup root into `/sys/fs/cgroup/init` so cgroup v2 can delegate controllers to pods, the same trick kind uses.
 
 ## Ports
 
@@ -494,15 +518,17 @@ JSON spec/labels/annotations stored as `TEXT`; UUIDs and timestamps as ISO strin
 ## Known caveats
 
 - **`kubectl apply` on existing objects** uses HTTP `PATCH`, which we don't implement yet. First-time apply (PUT/POST) works; re-applying a changed resource currently fails with `MethodNotAllowed`. Workarounds: `kubectl replace -f file.yaml --force`, or `delete` + `apply`.
-- **Embedded runtime**: skeleton only — image pull and libcontainer wiring are in place, but pod networking, log capture, and exec aren't yet hooked up. On Linux today, `--runtime=docker` is the productive choice.
-- **No CNI**: pod IPs are assigned from `--pod-cidr` (default `10.244.0.0/16`) but pod-to-pod connectivity isn't wired. Service traffic works because the NodePort proxy connects to the host port that Docker publishes for each container.
+- **`kubectl port-forward`** fails at the upgrade. Current kubectl tunnels SPDY/3.1 inside the WebSocket (`SPDY/3.1+portforward.k8s.io`); the server speaks neither SPDY nor that tunnel. `exec`/`logs` use the plain channel protocol and are fine. Reach a pod via a NodePort Service, or its bridge IP from the node.
+- **Embedded networking is single-host**: same-node pod-to-pod and egress work through the `superkube0` bridge; there's no overlay between nodes. Each *container* currently gets its own netns and IP (containers of one pod don't share `localhost`), and pods get no `/etc/resolv.conf`, so DNS inside pods doesn't resolve yet.
+- **Containers aren't restarted**: an exited container is reported as terminated and left alone, whatever `restartPolicy` says. The embedded engine supports same-name restarts (overlay reset, restart count carried); the agent just doesn't ask for them yet. The embedded engine's container table is also in-memory — restart the agent and it forgets running containers.
+- **No resource limits / seccomp / AppArmor** in the embedded engine: the bundle doesn't emit them, and `securityContext` isn't honoured.
 - **No CSI / no persistent storage**: there is no CSI driver, and `PersistentVolume`, `PersistentVolumeClaim`, and `StorageClass` are not implemented. Pods can only use the volume types the container runtime gives you for free (`emptyDir`, `hostPath`-style bind mounts via Docker). StatefulSets reconcile their pods but do not provision per-replica volumes.
 - **No RBAC enforcement**: ClusterRole/Binding objects round-trip through the API but are not consulted at request time. The API has no auth.
 - **OpenAPI schemas** aren't generated. We serve a benign empty `/openapi/v2` (zero bytes, parses as an empty protobuf `Document`) and an empty `/openapi/v3` JSON, so kubectl validation passes without `--validate=false`.
 
 ## Status
 
-Hobby project — built incrementally. The pieces above all work end-to-end on macOS through Docker Desktop; the Linux embedded path compiles but needs a Linux box to actually exercise.
+Hobby project — built incrementally. The pieces above work end-to-end on macOS through Docker Desktop and on Linux through the embedded engine (exercised on Debian 12 / kernel 6.1, bare and inside a privileged Docker container).
 
 ## License
 

@@ -13,7 +13,7 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::models::*;
 
-use super::runtime::{self, LogOptions, PortMapping, Runtime};
+use super::runtime::{Engines, LogOptions, PortMapping, Runtime};
 
 /// Node agent HTTP server port
 const NODE_AGENT_PORT: u16 = 10250;
@@ -61,7 +61,8 @@ pub(super) struct AgentState {
     pub labels: HashMap<String, String>,
     pub server_url: String,
     pub client: Client,
-    pub runtime: Box<dyn Runtime>,
+    /// Every engine on this node; pods pick one via `spec.runtimeClassName`.
+    pub runtime: Engines,
     /// Pod CIDR — first three octets become the /24 prefix used to assemble
     /// pod IPs from the pod UID.
     pub pod_cidr_prefix: String,
@@ -73,6 +74,10 @@ pub(super) struct AgentState {
     /// Read by the NodePort proxy to find a local backend host port for an
     /// endpoint pod hosted on this node.
     pub pod_ports: HashMap<(String, String), Vec<PortMapping>>,
+    /// Map of (namespace, pod_name) → the pod IP the runtime reported. The
+    /// NodePort proxy dials this when the runtime publishes no host port
+    /// (embedded: the host routes to the pod bridge directly).
+    pub pod_ips: HashMap<(String, String), String>,
 }
 
 /// Node agent that manages containers on this node
@@ -89,8 +94,12 @@ impl NodeAgent {
         pod_cidr: String,
         runtime_kind: &str,
     ) -> anyhow::Result<Self> {
-        let runtime = runtime::select(containerd_socket, runtime_kind).await?;
-        tracing::info!("node agent runtime: {}", runtime.name());
+        let runtime = Engines::build(containerd_socket, runtime_kind).await?;
+        tracing::info!(
+            "node agent engines: default={} available={:?}",
+            runtime.default_name(),
+            runtime.names()
+        );
 
         let pod_cidr_prefix = pod_cidr_to_prefix(&pod_cidr);
         tracing::info!("pod CIDR: {} (assigning IPs as {}.X)", pod_cidr, pod_cidr_prefix);
@@ -105,6 +114,7 @@ impl NodeAgent {
             containers: HashMap::new(),
             pod_containers: HashMap::new(),
             pod_ports: HashMap::new(),
+            pod_ips: HashMap::new(),
         };
 
         Ok(Self {
@@ -225,11 +235,16 @@ impl NodeAgent {
 
         let pod_list: List<Pod> = response.json().await?;
 
+        let mut desired: HashSet<(String, String)> = HashSet::new();
         for pod in pod_list.items {
             // Check if pod is assigned to this node
             if pod.spec.node_name.as_deref() != Some(&name) {
                 continue;
             }
+            desired.insert((
+                pod.metadata.namespace().to_string(),
+                pod.metadata.name().to_string(),
+            ));
 
             if let Err(e) = self.reconcile_pod(&pod).await {
                 tracing::error!(
@@ -241,7 +256,31 @@ impl NodeAgent {
             }
         }
 
+        self.sweep_orphans(&desired).await;
         Ok(())
+    }
+
+    /// Stop containers we started for pods the server no longer assigns to
+    /// this node — deleted, evicted, or rescheduled — and forget them.
+    async fn sweep_orphans(&self, desired: &HashSet<(String, String)>) {
+        let mut state = self.state.write().await;
+        let orphans: Vec<((String, String, String), String)> = state
+            .pod_containers
+            .iter()
+            .filter(|((ns, pod, _), _)| !desired.contains(&(ns.clone(), pod.clone())))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for ((ns, pod, cname), id) in orphans {
+            let runtime_name = format!("{}-{}", pod, cname);
+            tracing::info!("pod {}/{} gone: removing container {}", ns, pod, runtime_name);
+            if let Err(e) = state.runtime.remove_container(&runtime_name).await {
+                tracing::warn!("remove container {}: {}", runtime_name, e);
+            }
+            state.pod_containers.remove(&(ns.clone(), pod.clone(), cname));
+            state.pod_ports.remove(&(ns.clone(), pod.clone()));
+            state.pod_ips.remove(&(ns, pod));
+            state.containers.retain(|_, v| v != &id);
+        }
     }
 
     /// Reconcile a single pod — observe runtime state, create missing
@@ -294,11 +333,12 @@ impl NodeAgent {
                     )
                     .await;
                     let mut state = self.state.write().await;
-                    match state
-                        .runtime
-                        .create_and_start_container(&docker_name, container)
-                        .await
-                    {
+                    let class = pod.spec.runtime_class_name.as_deref();
+                    let started = match state.runtime.for_class(class) {
+                        Ok(engine) => engine.create_and_start_container(&docker_name, container).await,
+                        Err(e) => Err(e),
+                    };
+                    match started {
                         Ok(_id) => {
                             let info = state
                                 .runtime
@@ -471,7 +511,16 @@ impl NodeAgent {
         // pod-CIDR-derived address only if no container has come up far
         // enough to expose a real one yet.
         let pod_ip = match runtime_ip {
-            Some(ip) => ip,
+            Some(ip) => {
+                // Only runtime-reported addresses are routable from this host;
+                // the synthetic fallback below is a placeholder for kubectl.
+                self.state
+                    .write()
+                    .await
+                    .pod_ips
+                    .insert((namespace.clone(), pod_name.clone()), ip.clone());
+                ip
+            }
             None => {
                 let s = self.state.read().await;
                 format!(
@@ -1248,6 +1297,7 @@ async fn handle_exec_websocket(
     let mut output = session.output;
     let mut input = session.input;
     let resize = session.resize;
+    let exit = session.exit;
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -1270,13 +1320,27 @@ async fn handle_exec_websocket(
                 }
             }
         }
-        // Tell kubectl the exec finished successfully. Without this
-        // sentinel on the error channel, kubectl logs an "abnormal closure"
-        // warning when the WS just goes away after stdout ends.
-        let status = br#"{"metadata":{},"status":"Success"}"#;
+        // Tell kubectl how the exec finished, on the error channel (3).
+        // Without this sentinel kubectl logs an "abnormal closure" warning
+        // when the WS just goes away after stdout ends. A non-zero exit code
+        // is reported the way the kubelet does it, so `kubectl exec` itself
+        // exits with that code.
+        let code = match exit {
+            Some(rx) => tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok()),
+            None => None,
+        };
+        let status = match code {
+            Some(c) if c != 0 => format!(
+                r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with non-zero exit code: exit status {c}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{c}"}}]}}}}"#
+            ),
+            _ => r#"{"metadata":{},"status":"Success"}"#.to_string(),
+        };
         let mut frame = Vec::with_capacity(status.len() + 1);
         frame.push(3u8); // error channel
-        frame.extend_from_slice(status);
+        frame.extend_from_slice(status.as_bytes());
         let _ = ws_tx.send(Message::Binary(frame)).await;
         let _ = ws_tx.close().await;
     };
@@ -1322,11 +1386,20 @@ async fn handle_exec_websocket(
     tracing::info!("exec session ended");
 }
 
-/// Build a Kubernetes error-channel frame (channel 3).
+/// Build a Kubernetes error-channel frame (channel 3). In the v4 stream
+/// protocol kubectl parses this channel as a `metav1.Status`, so a bare
+/// string makes it fail with "error stream protocol error".
 fn error_frame(msg: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(msg.len() + 1);
+    let status = serde_json::json!({
+        "metadata": {},
+        "status": "Failure",
+        "message": msg,
+        "reason": "InternalError",
+    })
+    .to_string();
+    let mut out = Vec::with_capacity(status.len() + 1);
     out.push(3u8);
-    out.extend_from_slice(msg.as_bytes());
+    out.extend_from_slice(status.as_bytes());
     out
 }
 

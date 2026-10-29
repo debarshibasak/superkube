@@ -24,7 +24,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use oci_spec::runtime::{
-    LinuxBuilder, LinuxIdMappingBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder,
+    Capabilities, Capability, LinuxBuilder, LinuxCapabilities, LinuxCapabilitiesBuilder,
+    LinuxIdMappingBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder,
     ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
 
@@ -87,6 +88,7 @@ pub fn build_spec(inputs: &BundleInputs<'_>) -> Result<Spec> {
         .args(args)
         .env(env)
         .cwd(cwd)
+        .capabilities(default_capabilities()?)
         .build()
         .context("building OCI process")?;
 
@@ -130,6 +132,39 @@ pub fn build_spec(inputs: &BundleInputs<'_>) -> Result<Spec> {
         .context("building OCI spec")?;
 
     Ok(spec)
+}
+
+/// Docker's default capability set — what a container gets unless the pod
+/// asks for more or less (`securityContext.capabilities` isn't wired yet).
+/// Without an explicit set libcontainer leaves the process with *every*
+/// capability; with one, root inside the container can chown/bind/kill
+/// like it expects but can't, say, mount or load kernel modules.
+/// Inheritable and ambient stay empty, as in Docker and runc.
+fn default_capabilities() -> Result<LinuxCapabilities> {
+    let caps: Capabilities = [
+        Capability::Chown,
+        Capability::DacOverride,
+        Capability::Fsetid,
+        Capability::Fowner,
+        Capability::Mknod,
+        Capability::NetRaw,
+        Capability::Setgid,
+        Capability::Setuid,
+        Capability::Setfcap,
+        Capability::Setpcap,
+        Capability::NetBindService,
+        Capability::SysChroot,
+        Capability::Kill,
+        Capability::AuditWrite,
+    ]
+    .into_iter()
+    .collect();
+    LinuxCapabilitiesBuilder::default()
+        .bounding(caps.clone())
+        .effective(caps.clone())
+        .permitted(caps)
+        .build()
+        .context("building default capabilities")
 }
 
 /// Kubernetes command/args → OCI args, per the documented merge rules:

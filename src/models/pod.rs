@@ -65,6 +65,11 @@ pub struct PodSpec {
     /// during pod placement; preferred terms are stored but not yet weighted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity: Option<super::Affinity>,
+
+    /// Engine that runs this pod's containers — `embedded`, `docker`,
+    /// `wasm`, `mock`. Unset means the node's default (`--runtime=`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_class_name: Option<String>,
 }
 
 /// Container describes a single container in a pod
